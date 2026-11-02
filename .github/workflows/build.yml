@@ -6,6 +6,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write          # necesario para publicar la versión descargable
+
 jobs:
   build:
     runs-on: ubuntu-latest          # esta máquina ya trae el SDK de Android
@@ -26,9 +29,24 @@ jobs:
       - name: Compilar
         run: gradle assembleRelease --no-daemon
 
-      - name: Publicar el APK para descargar
+      - name: Preparar el APK
+        run: |
+          mkdir -p salida
+          cp app/build/outputs/apk/release/*.apk salida/JhaKet-IPTV.apk
+          ls -lh salida/
+
+      - name: Guardar el APK como artefacto
         uses: actions/upload-artifact@v4
         with:
           name: JhaKet-IPTV-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: salida/JhaKet-IPTV.apk
           if-no-files-found: error
+
+      # Deja el .apk con descarga directa, sin tener que descomprimir nada en el teléfono.
+      - name: Publicar versión descargable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ github.run_number }}" salida/JhaKet-IPTV.apk \
+            --title "JhaKet IPTV v${{ github.run_number }}" \
+            --notes "APK para teléfono Android, Android TV y Google TV. Se instala habilitando orígenes desconocidos."
