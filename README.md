@@ -2,6 +2,19 @@
 
 Reproductor JhaKet empaquetado como app para teléfono Android, Android TV y Google TV.
 
+## Versión 2: cargador + protección contra anuncios
+
+- El APK ya no lleva el reproductor adentro: `assets/index.html` es un **cargador** que baja
+  la versión actual de JhaKet desde `https://jhaketiptv.floot.app/_api/ext/app` y la ejecuta
+  (con copia guardada por si no hay internet). Las mejoras llegan solas, sin reinstalar.
+- **Ningún reproductor de página web puede reemplazar la app**: la ventana principal no
+  navega a otros sitios. Se terminaron los "reinicios" al volver de un anuncio.
+- **Las ventanas emergentes (anuncios) se descartan** sin mostrarse. Sólo se abren en el
+  navegador los enlaces propios (panel web, tienda para instalar VLC o MX Player).
+- **`intent://` sólo para VLC y MX Player**; los que mandan los anuncios se ignoran.
+
+Los anuncios que una página dibuja adentro de su propio reproductor no se pueden quitar.
+
 ## Qué resuelve respecto al archivo HTML
 
 - **Los pedidos a internet funcionan.** Abriendo el `.html` desde Descargas, Android lo sirve
