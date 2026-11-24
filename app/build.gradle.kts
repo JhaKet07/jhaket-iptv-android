@@ -11,8 +11,8 @@ android {
         applicationId = "com.jhaket.iptv"
         minSdk = 21              // alcanza decodificadores viejos de Android TV
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "2.1"
     }
 
     buildTypes {
