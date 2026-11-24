@@ -1,9 +1,11 @@
 package com.jhaket.iptv
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -146,6 +148,15 @@ class MainActivity : Activity() {
         web.loadUrl(APP_URL)
 
         hideSystemBars()
+
+        // Notificaciones del administrador: canal, permiso (Android 13+) y revisión periódica.
+        Avisos.crearCanal(this)
+        Avisos.programar(this)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
     }
 
     /**
@@ -229,6 +240,12 @@ class MainActivity : Activity() {
             }
         }
 
+        /** La página pasa la sesión del usuario ("" al cerrar sesión) para buscar avisos. */
+        @JavascriptInterface
+        fun setSession(token: String?) {
+            Avisos.guardarSesion(applicationContext, token ?: "")
+        }
+
         /** Para que la página sepa que corre dentro de esta app (con la protección nativa). */
         @JavascriptInterface
         fun nativo(): Boolean = true
@@ -281,6 +298,6 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() { super.onPause(); web.onPause() }
-    override fun onResume() { super.onResume(); web.onResume(); hideSystemBars() }
+    override fun onResume() { super.onResume(); web.onResume(); hideSystemBars(); Avisos.revisarYa(this) }
     override fun onDestroy() { web.destroy(); super.onDestroy() }
 }

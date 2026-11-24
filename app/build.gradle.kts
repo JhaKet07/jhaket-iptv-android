@@ -11,8 +11,8 @@ android {
         applicationId = "com.jhaket.iptv"
         minSdk = 21              // alcanza decodificadores viejos de Android TV
         targetSdk = 34
-        versionCode = 3
-        versionName = "2.1"
+        versionCode = 4
+        versionName = "2.2"
     }
 
     buildTypes {
@@ -32,4 +32,6 @@ android {
 
 dependencies {
     implementation("androidx.webkit:webkit:1.12.1")
+    // Revisión de avisos en segundo plano cada 15 minutos
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
 }
