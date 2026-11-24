@@ -26,7 +26,23 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
+      # La clave de firma vive en los secretos del repositorio (Settings → Secrets → Actions):
+      # JHAKET_KEYSTORE_B64 (la clave en base64) y JHAKET_KEYSTORE_PASS (su contraseña).
+      - name: Preparar la clave de firma
+        env:
+          CLAVE: ${{ secrets.JHAKET_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$CLAVE" ]; then
+            echo "$CLAVE" | base64 -d > "$RUNNER_TEMP/jhaket.jks"
+            echo "JHAKET_KEYSTORE_FILE=$RUNNER_TEMP/jhaket.jks" >> "$GITHUB_ENV"
+            echo "Se firma con la clave propia de JhaKet."
+          else
+            echo "No hay clave propia cargada: se firma con la de depuración."
+          fi
+
       - name: Compilar
+        env:
+          JHAKET_KEYSTORE_PASS: ${{ secrets.JHAKET_KEYSTORE_PASS }}
         run: gradle assembleRelease --no-daemon
 
       - name: Preparar el APK

@@ -11,16 +11,30 @@ android {
         applicationId = "com.jhaket.iptv"
         minSdk = 21              // alcanza decodificadores viejos de Android TV
         targetSdk = 34
-        versionCode = 4
-        versionName = "2.2"
+        versionCode = 5
+        versionName = "2.3"
+    }
+
+    // Clave propia de JhaKet: llega desde los secretos de GitHub (ver build.yml). Con la
+    // misma firma siempre, cada APK nuevo se instala encima del anterior sin desinstalar.
+    val claveArchivo = System.getenv("JHAKET_KEYSTORE_FILE")
+    val claveContrasena = System.getenv("JHAKET_KEYSTORE_PASS")
+    signingConfigs {
+        if (claveArchivo != null && claveContrasena != null) {
+            create("jhaket") {
+                storeFile = file(claveArchivo)
+                storePassword = claveContrasena
+                keyAlias = "jhaket"
+                keyPassword = claveContrasena
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Se firma con la clave de depuración para poder instalarlo sin trámites.
-            // Para publicar en Google Play hay que generar una clave propia.
-            signingConfig = signingConfigs.getByName("debug")
+            // Sin la clave propia (secretos sin cargar) se usa la de depuración.
+            signingConfig = signingConfigs.findByName("jhaket") ?: signingConfigs.getByName("debug")
         }
     }
     compileOptions {
