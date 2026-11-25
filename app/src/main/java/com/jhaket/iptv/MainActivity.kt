@@ -40,6 +40,9 @@ class MainActivity : Activity() {
 
     private lateinit var web: WebView
 
+    /** true mientras se está reproduciendo un contenido: ahí sí se ocultan las barras. */
+    @Volatile private var reproduciendo = false
+
     companion object {
         const val APP_HOST = "appassets.androidplatform.net"
         const val APP_URL = "https://$APP_HOST/assets/index.html"
@@ -246,6 +249,18 @@ class MainActivity : Activity() {
             Avisos.guardarSesion(applicationContext, token ?: "")
         }
 
+        /** La página avisa cuando abre o cierra el reproductor. Fuera del reproductor
+            se ve la barra de navegación de Android; al reproducir, pantalla completa. */
+        @JavascriptInterface
+        fun setPlaying(playing: Boolean) {
+            runOnUiThread {
+                if (reproduciendo != playing) {
+                    reproduciendo = playing
+                    hideSystemBars()
+                }
+            }
+        }
+
         /** Para que la página sepa que corre dentro de esta app (con la protección nativa). */
         @JavascriptInterface
         fun nativo(): Boolean = true
@@ -279,15 +294,24 @@ class MainActivity : Activity() {
         if (hasFocus) hideSystemBars()
     }
 
+    /**
+     * Barras del sistema:
+     *  - Reproduciendo: pantalla completa (sin barra de estado ni de navegación).
+     *  - Resto de la app: la barra de navegación de Android queda visible, y el contenido
+     *    se acomoda arriba de ella (no queda tapado). La barra de estado sigue oculta.
+     */
     @Suppress("DEPRECATION")
     private fun hideSystemBars() {
-        window.decorView.systemUiVisibility = (
+        window.decorView.systemUiVisibility = if (reproduciendo) (
             View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                 or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                 or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                 or View.SYSTEM_UI_FLAG_FULLSCREEN
                 or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            ) else (
+            View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                or View.SYSTEM_UI_FLAG_FULLSCREEN
             )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             val lp = window.attributes      // hay que reasignar: cambiarlo en el lugar no surte efecto
