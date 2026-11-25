@@ -14,6 +14,7 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -39,6 +40,10 @@ import androidx.webkit.WebViewAssetLoader
 class MainActivity : Activity() {
 
     private lateinit var web: WebView
+
+    /** Pedido de archivo en curso (botones "Elegir archivo" de la página). */
+    private var subida: ValueCallback<Array<Uri>>? = null
+    private val pedidoArchivo = 4207
 
     /** true mientras se está reproduciendo un contenido: ahí sí se ocultan las barras. */
     @Volatile private var reproduciendo = false
@@ -112,6 +117,39 @@ class MainActivity : Activity() {
         }
 
         web.webChromeClient = object : WebChromeClient() {
+            /* "Elegir archivo" de la página (fondos, videos, listas M3U, HTML de la app):
+               se abre el selector de archivos del teléfono. Sin esto el botón no hace nada. */
+            override fun onShowFileChooser(
+                view: WebView, callback: ValueCallback<Array<Uri>>, params: FileChooserParams
+            ): Boolean {
+                subida?.onReceiveValue(null)
+                subida = callback
+                // accept="image/*,video/mp4" llega como uno o varios textos; las extensiones
+                // (".m3u") no sirven para el selector y se ignoran.
+                val tipos = params.acceptTypes
+                    .flatMap { it.split(",") }
+                    .map { it.trim().lowercase() }
+                    .filter { it.contains("/") }
+                    .distinct()
+                val elegir = Intent(Intent.ACTION_GET_CONTENT).addCategory(Intent.CATEGORY_OPENABLE)
+                if (tipos.size == 1) {
+                    elegir.type = tipos[0]
+                } else {
+                    elegir.type = "*/*"
+                    if (tipos.isNotEmpty()) elegir.putExtra(Intent.EXTRA_MIME_TYPES, tipos.toTypedArray())
+                }
+                if (params.mode == FileChooserParams.MODE_OPEN_MULTIPLE) elegir.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                return try {
+                    @Suppress("DEPRECATION")
+                    startActivityForResult(Intent.createChooser(elegir, "Elegir archivo"), pedidoArchivo)
+                    true
+                } catch (e: ActivityNotFoundException) {
+                    subida = null
+                    callback.onReceiveValue(null)
+                    false
+                }
+            }
+
             /* Una página quiere abrir una ventana nueva. Se le da una ventana "de mentira"
                que nunca se muestra: si el destino es un sitio propio de JhaKet (el panel
                web, la tienda para instalar VLC) y lo pidió el usuario, se abre en el
@@ -319,6 +357,27 @@ class MainActivity : Activity() {
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             window.attributes = lp
         }
+    }
+
+    /** Vuelve del selector de archivos: se le pasa a la página lo que se eligió (o nada). */
+    @Deprecated("Se mantiene por compatibilidad con Android viejo")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode != pedidoArchivo) {
+            @Suppress("DEPRECATION")
+            super.onActivityResult(requestCode, resultCode, data)
+            return
+        }
+        val cb = subida
+        subida = null
+        if (cb == null) return
+        if (resultCode != RESULT_OK || data == null) { cb.onReceiveValue(null); return }
+        val clip = data.clipData
+        val elegidos: Array<Uri>? = when {
+            clip != null && clip.itemCount > 0 -> Array(clip.itemCount) { clip.getItemAt(it).uri }
+            data.data != null -> arrayOf(data.data!!)
+            else -> null
+        }
+        cb.onReceiveValue(elegidos)
     }
 
     override fun onPause() { super.onPause(); web.onPause() }
