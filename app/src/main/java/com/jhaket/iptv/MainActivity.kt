@@ -302,6 +302,15 @@ class MainActivity : Activity() {
         /** Para que la página sepa que corre dentro de esta app (con la protección nativa). */
         @JavascriptInterface
         fun nativo(): Boolean = true
+
+        /** Número de versión instalada. Coincide con el número de la versión publicada en
+            GitHub (v10, v11…): así la página sabe si hay una más nueva para descargar. */
+        @JavascriptInterface
+        fun version(): Int = try {
+            val info = packageManager.getPackageInfo(packageName, 0)
+            @Suppress("DEPRECATION")
+            if (Build.VERSION.SDK_INT >= 28) info.longVersionCode.toInt() else info.versionCode
+        } catch (e: Exception) { 0 }
     }
 
     /**

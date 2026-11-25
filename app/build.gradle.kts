@@ -11,8 +11,11 @@ android {
         applicationId = "com.jhaket.iptv"
         minSdk = 21              // alcanza decodificadores viejos de Android TV
         targetSdk = 34
-        versionCode = 7
-        versionName = "2.5"
+        // El número de versión es el de la compilación en GitHub (el mismo de la versión
+        // publicada: v10, v11…), así "Buscar actualización" compara directo.
+        val compilacion = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
+        versionCode = compilacion ?: 7
+        versionName = if (compilacion != null) "2.6 (v$compilacion)" else "2.6"
     }
 
     // Clave propia de JhaKet: llega desde los secretos de GitHub (ver build.yml). Con la
