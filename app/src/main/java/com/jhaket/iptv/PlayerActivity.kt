@@ -143,6 +143,8 @@ class PlayerActivity : Activity() {
     // VLC
     private var libVlc: LibVLC? = null
     private var vlc: org.videolan.libvlc.MediaPlayer? = null
+    /** Decodificar la imagen por software (más compatible; usa más batería). Se elige desde el menú. */
+    private var porSoftware = false
 
     // ============================================================
     // Inicio
@@ -367,7 +369,7 @@ class PlayerActivity : Activity() {
         bSiguiente.visibility = if (varios) View.VISIBLE else View.GONE
         bAnterior.isEnabled = indice > 0; bAnterior.alpha = if (indice > 0) 1f else 0.35f
         bSiguiente.isEnabled = indice < items.size - 1; bSiguiente.alpha = if (indice < items.size - 1) 1f else 0.35f
-        tMotor.text = if (vlc != null) "VLC" else "EXO"
+        tMotor.text = if (vlc != null) (if (porSoftware) "VLC · SW" else "VLC") else "EXO"
         tCalidad.visibility = View.GONE
     }
 
@@ -507,10 +509,21 @@ class PlayerActivity : Activity() {
                 }
             } catch (e: Throwable) { }
         }
-        if (nombres.isEmpty()) { mostrarIndicador("Este contenido trae\nun solo audio", 1500); return }
+        // Para canales que se ven con cuadros verdes o rayas: VLC decodificando por software.
+        if (!(vlc != null && porSoftware)) {
+            nombres.add("Imagen con cuadros verdes o rayas: decodificar por software")
+            acciones.add {
+                porSoftware = true
+                if (vlc != null) {
+                    inicioMs = if (itemActual.vivo) 0 else posicion()
+                    liberarVlc(); arrancarVlc(); acomodarControles()
+                    mostrarAviso("Decodificando por software", 2500)
+                } else pasarAVlc("Decodificando por software (VLC)…")
+            }
+        }
         handler.removeCallbacks(ocultarControlesR)
         AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle("Audio y subtítulos")
+            .setTitle("Audio, subtítulos e imagen")
             .setItems(nombres.toTypedArray()) { _, i -> acciones[i](); mostrarControles() }
             .setOnDismissListener { pantallaCompleta(); mostrarControles() }
             .show()
@@ -711,7 +724,8 @@ class PlayerActivity : Activity() {
             .setKeepPostFor302Redirects(true)
         val datos = DefaultDataSource.Factory(this, http)
         val extractores = DefaultExtractorsFactory()
-            .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS)
+            // Se espera un cuadro completo antes de mostrar imagen: arrancar sin él daba cuadros verdes.
+            .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS)
             .setConstantBitrateSeekingEnabled(true)
         val fuentes = DefaultMediaSourceFactory(datos, extractores).setLoadErrorHandlingPolicy(Reintentos())
         val renderers = DefaultRenderersFactory(this)
@@ -851,7 +865,7 @@ class PlayerActivity : Activity() {
             ponerVideo(capa)
             mp.attachViews(capa, null, false, false)
             val m = Media(lib, Uri.parse(itemActual.url))
-            m.setHWDecoderEnabled(true, false)
+            m.setHWDecoderEnabled(!porSoftware, false)
             m.addOption(":http-user-agent=$userAgent")
             m.addOption(":network-caching=3000")
             mp.media = m
