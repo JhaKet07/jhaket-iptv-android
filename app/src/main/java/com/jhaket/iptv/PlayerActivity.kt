@@ -78,7 +78,8 @@ import org.videolan.libvlc.util.VLCVideoLayout
 @OptIn(UnstableApi::class)
 class PlayerActivity : Activity() {
 
-    private data class Item(val url: String, val nombre: String, val vivo: Boolean, val logo: String = "")
+    private data class Prog(val titulo: String, val inicio: Long, val fin: Long)
+    private data class Item(val url: String, val nombre: String, val vivo: Boolean, val logo: String = "", val guia: List<Prog> = emptyList())
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var raiz: FrameLayout
@@ -91,6 +92,8 @@ class PlayerActivity : Activity() {
     private lateinit var controles: FrameLayout
     private lateinit var tTitulo: TextView
     private lateinit var iLogo: ImageView
+    private lateinit var tAhora: TextView
+    private lateinit var tDespues: TextView
     /** Logos ya descargados (al cambiar de canal no se vuelven a bajar). */
     private val logos = HashMap<String, android.graphics.Bitmap?>()
     private lateinit var tTipo: TextView
@@ -184,7 +187,15 @@ class PlayerActivity : Activity() {
             if (arr != null) for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
                 val u = o.optString("u")
-                if (u.isNotEmpty()) lista.add(Item(u, o.optString("n", ""), o.optBoolean("live", false), o.optString("l", "")))
+                if (u.isNotEmpty()) {
+                    val g = o.optJSONArray("g")
+                    val progs = mutableListOf<Prog>()
+                    if (g != null) for (k in 0 until g.length()) {
+                        val pr = g.optJSONObject(k) ?: continue
+                        progs.add(Prog(pr.optString("t", ""), pr.optLong("s", 0L), pr.optLong("e", 0L)))
+                    }
+                    lista.add(Item(u, o.optString("n", ""), o.optBoolean("live", false), o.optString("l", ""), progs))
+                }
             }
             items = lista
             indice = j.optInt("index", 0).coerceIn(0, maxOf(0, lista.size - 1))
@@ -275,6 +286,10 @@ class PlayerActivity : Activity() {
         sub.addView(tTipo)
         sub.addView(tCalidad, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8) })
         info.addView(sub)
+        tAhora = texto(14f, true).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setPadding(0, dp(5), 0, 0); visibility = View.GONE }
+        tDespues = texto(12f).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setTextColor(0xCCFFFFFF.toInt()); visibility = View.GONE }
+        info.addView(tAhora)
+        info.addView(tDespues)
         arriba.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
         tMotor = texto(12f, true).apply {
             setPadding(dp(9), dp(4), dp(9), dp(4)); setShadowLayer(0f, 0f, 0f, 0)
@@ -370,6 +385,7 @@ class PlayerActivity : Activity() {
         val vivo = itemActual.vivo
         tTitulo.text = itemActual.nombre
         ponerLogo(itemActual.logo)
+        mostrarGuia()
         tTipo.text = if (vivo) "EN VIVO" else "PELÍCULA / SERIE"
         tTipo.background = pastilla(if (vivo) 0xFFE53935.toInt() else 0x33FFFFFF)
         bAtras10.visibility = if (vivo) View.GONE else View.VISIBLE
@@ -383,6 +399,35 @@ class PlayerActivity : Activity() {
         bSiguiente.isEnabled = indice < items.size - 1; bSiguiente.alpha = if (indice < items.size - 1) 1f else 0.35f
         tMotor.text = if (vlc != null) (if (porSoftware) "VLC · SW" else "VLC") else "EXO"
         tCalidad.visibility = View.GONE
+    }
+
+    private fun hora(ms: Long): String {
+        val c = java.util.Calendar.getInstance().apply { timeInMillis = ms }
+        return String.format("%02d:%02d", c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE))
+    }
+
+    /** Guía de programación: lo que está al aire ahora y lo que sigue (sólo canales en vivo). */
+    private var guiaMostrada = ""
+    private fun mostrarGuia() {
+        if (items.isEmpty() || !itemActual.vivo || itemActual.guia.isEmpty()) {
+            tAhora.visibility = View.GONE; tDespues.visibility = View.GONE; guiaMostrada = ""; return
+        }
+        val ahora = System.currentTimeMillis()
+        val g = itemActual.guia
+        val i = g.indexOfFirst { it.inicio <= ahora && it.fin > ahora }
+        val actual = if (i >= 0) g[i] else null
+        val sigue = if (i >= 0) g.getOrNull(i + 1) else g.firstOrNull { it.inicio > ahora }
+        val clave = itemActual.url + "|" + (actual?.inicio ?: 0) + "|" + (sigue?.inicio ?: 0)
+        if (clave == guiaMostrada) return
+        guiaMostrada = clave
+        if (actual != null) {
+            tAhora.text = actual.titulo + "   " + hora(actual.inicio) + " – " + hora(actual.fin)
+            tAhora.visibility = View.VISIBLE
+        } else tAhora.visibility = View.GONE
+        if (sigue != null) {
+            tDespues.text = "Después: " + sigue.titulo + " · " + hora(sigue.inicio)
+            tDespues.visibility = View.VISIBLE
+        } else tDespues.visibility = View.GONE
     }
 
     /** Logo del canal al lado del nombre. Se baja una sola vez y se guarda. */
@@ -438,6 +483,7 @@ class PlayerActivity : Activity() {
                     tActual.text = tiempo(pos); tTotal.text = tiempo(d)
                 }
             }
+            mostrarGuia()
             val (w, h) = tamanoVideo()
             val q = etiquetaCalidad(w, h)
             if (q.isNotEmpty()) { tCalidad.text = q; tCalidad.visibility = View.VISIBLE }
