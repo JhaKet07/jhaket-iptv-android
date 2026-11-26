@@ -2,26 +2,28 @@ package com.jhaket.iptv
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
+import android.app.UiModeManager
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.app.UiModeManager
-import android.content.res.Configuration
-import android.graphics.drawable.GradientDrawable
-import android.media.AudioManager
-import android.provider.Settings
-import android.view.MotionEvent
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
@@ -31,16 +33,17 @@ import android.widget.SeekBar
 import android.widget.TextView
 import androidx.annotation.OptIn
 import androidx.media3.common.C
-import androidx.media3.common.ParserException
-import androidx.media3.datasource.HttpDataSource
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.ParserException
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -58,18 +61,18 @@ import org.videolan.libvlc.Media
 import org.videolan.libvlc.util.VLCVideoLayout
 
 /**
- * Reproductor nativo de JhaKet.
+ * Reproductor nativo de JhaKet: un solo reproductor, con la misma cara que el de antes.
  *
- * Motor principal: ExoPlayer (Media3) con HLS, DASH, MPEG-TS, MP4/MKV, RTSP y RTMP, y los
- * decodificadores de audio de FFmpeg (AC3, E-AC3, DTS, TrueHD, MP2…) para que ningún canal
- * quede sin sonido. Si ExoPlayer no puede con un enlace, pasa solo a VLC (libVLC), que trae
- * todos sus códecs adentro. Los esquemas que ExoPlayer no conoce (udp, rtp, mms…) van
- * directo a VLC.
+ * Motores: ExoPlayer (Media3) con los decodificadores de audio de FFmpeg y, si no puede con
+ * un enlace, VLC (libVLC) automáticamente. Arriba a la derecha se ve cuál está andando
+ * (EXO o VLC).
  *
- * Para que no se corte: búfer más grande, reintentos con espera creciente, reconexión al
- * vivo si se queda atrás, y un vigía que reinicia la señal si se traba cargando.
+ * Pantalla: arriba volver, título, si es en vivo o película y la calidad real; en el medio
+ * anterior, -10 s, pausa, +10 s y siguiente; abajo la barra de tiempo (o EN VIVO), audio y
+ * subtítulos, formato de imagen y bloqueo. En el teléfono, deslizar del lado izquierdo
+ * cambia el volumen y del derecho el brillo (sólo se ve el porcentaje en el medio).
  *
- * Recibe en el extra "datos" un JSON: { items:[{u,n,live}], index, start, ua }.
+ * Recibe en el extra "datos": { items:[{u,n,live}], index, start, ua }.
  * Devuelve al salir: url, pos y dur (segundos) para "Continuar viendo".
  */
 @OptIn(UnstableApi::class)
@@ -77,114 +80,95 @@ class PlayerActivity : Activity() {
 
     private data class Item(val url: String, val nombre: String, val vivo: Boolean)
 
-    private lateinit var raiz: FrameLayout
-    private lateinit var titulo: TextView
-    private lateinit var estado: TextView
-    private lateinit var cargando: ProgressBar
     private val handler = Handler(Looper.getMainLooper())
+    private lateinit var raiz: FrameLayout
+    private lateinit var capaVideo: FrameLayout
+    private lateinit var cargando: ProgressBar
+    private lateinit var aviso: TextView          // mensajes de abajo ("Reconectando…")
+    private lateinit var indicador: TextView      // porcentaje de volumen o brillo, y avisos centrales
+
+    // Controles
+    private lateinit var controles: FrameLayout
+    private lateinit var tTitulo: TextView
+    private lateinit var tTipo: TextView
+    private lateinit var tCalidad: TextView
+    private lateinit var tMotor: TextView
+    private lateinit var bPlay: ImageButton
+    private lateinit var bAtras10: ImageButton
+    private lateinit var bAdelante10: ImageButton
+    private lateinit var bAnterior: ImageButton
+    private lateinit var bSiguiente: ImageButton
+    private lateinit var filaTiempo: LinearLayout
+    private lateinit var barra: SeekBar
+    private lateinit var tActual: TextView
+    private lateinit var tTotal: TextView
+    private lateinit var bVivo: TextView
+    private lateinit var bPistas: ImageButton
+    private lateinit var bAspecto: ImageButton
+    private lateinit var bBloquear: ImageButton
+    private lateinit var candado: ImageView       // el que aparece con la pantalla bloqueada
+    private var arrastrandoBarra = false
 
     private var items = listOf<Item>()
     private var indice = 0
     private var inicioMs = 0L
-    /* Se presenta como el navegador del teléfono, igual que el reproductor de la página
-       (que es lo que ya funcionaba con estas listas). Si el canal lo rechaza, se prueba
-       como VLC. */
+    private val itemActual get() = items[indice]
+
+    /* Se presenta como el navegador del teléfono (lo que ya funcionaba con estas listas);
+       si el canal lo rechaza, se prueba como VLC. */
     private var userAgent = ""
     private val uaVlc = "VLC/3.0.20 LibVLC/3.0.20"
-    private var probeUa = false
-    /** El canal llegó a reproducir: recién ahí el vigía lo reinicia si se traba. */
-    private var yaReprodujo = false
+
+    private var esTv = false
+    private var bloqueado = false
+    private var toqueEnCandado = false
+    private var modoAspecto = 0
+
+    // Gestos (sólo teléfono): 1 volumen, 2 brillo
+    private var gesto = 0
+    private var gx = 0f
+    private var gy = 0f
+    private var gInicio = 0f
+    private val audio by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
 
     // ExoPlayer
     private var exo: ExoPlayer? = null
     private var vista: PlayerView? = null
     private var reintentos = 0
     private var probeHls = false
+    private var probeUa = false
+    private var yaReprodujo = false
     private var cargandoDesde = 0L
-    private var modoAspecto = 0
 
     // VLC
     private var libVlc: LibVLC? = null
     private var vlc: org.videolan.libvlc.MediaPlayer? = null
-    private var vlcVista: VLCVideoLayout? = null
 
-    private val itemActual get() = items[indice]
+    // ============================================================
+    // Inicio
+    // ============================================================
 
-    // Bloqueo de pantalla
-    private var esTv = false
-    private var bloqueado = false
-    private lateinit var candado: ImageView
-    private var toqueEnCandado = false
-
-    // Gestos: izquierda = volumen, derecha = brillo (sólo en teléfonos)
-    private lateinit var indicador: TextView
-    private var gesto = 0          // 0 nada, 1 volumen, 2 brillo
-    private var gx = 0f
-    private var gy = 0f
-    private var gInicio = 0f
-    private val audio by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
-
-    // Controles propios cuando reproduce VLC
-    private var vlcControles: FrameLayout? = null
-    private var vlcPlay: ImageButton? = null
-    private var vlcBarra: SeekBar? = null
-    private var vlcTiempo: TextView? = null
-    private var arrastrandoBarra = false
-
-    @SuppressLint("SetTextI18n")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-
         userAgent = try {
             android.webkit.WebSettings.getDefaultUserAgent(this)
         } catch (e: Throwable) {
             "Mozilla/5.0 (Linux; Android ${Build.VERSION.RELEASE}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
         }
+        esTv = (getSystemService(UI_MODE_SERVICE) as UiModeManager).currentModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
+            packageManager.hasSystemFeature("android.software.leanback")
+
         leerDatos()
         if (items.isEmpty()) { finish(); return }
 
-        raiz = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        titulo = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setShadowLayer(6f, 0f, 1f, Color.BLACK)
-            setPadding(dp(20), dp(14), dp(20), dp(14))
-            maxLines = 1
-        }
-        estado = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            setBackgroundColor(0xAA000000.toInt())
-            setPadding(dp(14), dp(8), dp(14), dp(8))
-            visibility = View.GONE
-        }
-        cargando = ProgressBar(this).apply { isIndeterminate = true; visibility = View.GONE }
-        esTv = (getSystemService(UI_MODE_SERVICE) as UiModeManager).currentModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
-            packageManager.hasSystemFeature("android.software.leanback")
-        candado = ImageView(this).apply {
-            setImageResource(R.drawable.ic_candado_abierto)
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0x99000000.toInt()) }
-            setPadding(dp(13), dp(13), dp(13), dp(13))
-            contentDescription = "Bloquear la pantalla"
-            visibility = View.GONE
-            isClickable = true
-            setOnClickListener { alternarBloqueo() }
-        }
-        indicador = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
-            gravity = Gravity.CENTER
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(0xAA000000.toInt()) }
-            setPadding(dp(26), dp(14), dp(26), dp(14))
-            visibility = View.GONE
-        }
+        armarPantalla()
         setContentView(raiz)
         pantallaCompleta()
         arrancar()
         handler.postDelayed(vigia, 2000)
+        handler.post(actualizar)
     }
 
     private fun leerDatos() {
@@ -207,387 +191,359 @@ class PlayerActivity : Activity() {
         }
     }
 
-    // ===================== Elección del motor =====================
+    // ============================================================
+    // Pantalla: la misma disposición que el reproductor de antes
+    // ============================================================
 
-    private fun arrancar() {
-        liberarTodo()
-        reintentos = 0
-        probeHls = false
-        probeUa = false
-        yaReprodujo = false
-        cargandoDesde = 0L
-        val esquema = Uri.parse(itemActual.url).scheme?.lowercase() ?: ""
-        titulo.text = itemActual.nombre
-        if (esquema in setOf("udp", "rtp", "mms", "mmsh", "srt", "rtmps")) arrancarVlc()
-        else arrancarExo(null)
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun circulo(color: Int) = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(color) }
+    private fun pastilla(color: Int) = GradientDrawable().apply { cornerRadius = dp(6).toFloat(); setColor(color) }
+
+    private fun boton(icono: Int, desc: String, tam: Int, fondo: Int = 0x40000000, accion: () -> Unit) = ImageButton(this).apply {
+        setImageResource(icono)
+        background = circulo(fondo)
+        scaleType = ImageView.ScaleType.FIT_CENTER
+        val pad = (tam * 0.24f).toInt()
+        setPadding(dp(pad), dp(pad), dp(pad), dp(pad))
+        contentDescription = desc
+        isFocusable = true
+        layoutParams = LinearLayout.LayoutParams(dp(tam), dp(tam)).apply { leftMargin = dp(9); rightMargin = dp(9) }
+        setOnClickListener { accion(); mostrarControles() }
+        setOnFocusChangeListener { v, f -> v.scaleX = if (f) 1.15f else 1f; v.scaleY = v.scaleX; if (f) mostrarControles() }
     }
 
-    // ===================== ExoPlayer =====================
+    private fun texto(sp: Float, negrita: Boolean = false) = TextView(this).apply {
+        setTextColor(Color.WHITE)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, sp)
+        if (negrita) typeface = Typeface.DEFAULT_BOLD
+        setShadowLayer(6f, 0f, 1f, Color.BLACK)
+    }
 
-    /** Reintentos con espera creciente: en vivo se insiste más antes de dar error. */
-    private inner class Reintentos : DefaultLoadErrorHandlingPolicy() {
-        override fun getMinimumLoadableRetryCount(dataType: Int): Int = if (itemActual.vivo) 6 else 4
-        override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
-            val e = loadErrorInfo.exception
-            // El servidor rechazó el pedido (403, 404…) o lo que mandó no se entiende:
-            // insistir no sirve, se pasa enseguida a la otra estrategia.
-            if (e is HttpDataSource.InvalidResponseCodeException && e.responseCode in 400..499) return C.TIME_UNSET
-            if (e is ParserException) return C.TIME_UNSET
-            return (loadErrorInfo.errorCount * 1000L).coerceAtMost(4000L)
+    private fun armarPantalla() {
+        raiz = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        capaVideo = FrameLayout(this).apply {
+            // La imagen no consume los toques: los recibe esta capa y muestra u oculta los controles.
+            isClickable = true
+            setOnClickListener { alternarControles() }
         }
-    }
+        raiz.addView(capaVideo, FrameLayout.LayoutParams(-1, -1))
 
-    private fun tipoPorUrl(url: String, forzarHls: Boolean): String? {
-        if (forzarHls) return MimeTypes.APPLICATION_M3U8
-        val ruta = Uri.parse(url).path?.lowercase() ?: url.lowercase()
-        return when {
-            ruta.endsWith(".m3u8") || ruta.endsWith(".m3u") || url.contains("type=m3u8") -> MimeTypes.APPLICATION_M3U8
-            ruta.endsWith(".mpd") -> MimeTypes.APPLICATION_MPD
-            Uri.parse(url).scheme.equals("rtsp", true) -> MimeTypes.APPLICATION_RTSP
-            else -> null   // se detecta solo (TS, MP4, MKV, FLV…)
+        cargando = ProgressBar(this).apply { isIndeterminate = true; visibility = View.GONE }
+        raiz.addView(cargando, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.CENTER))
+
+        // ---- Controles ----
+        controles = FrameLayout(this).apply { visibility = View.GONE }
+
+        // Sombras arriba y abajo para que se lean los textos
+        controles.addView(View(this).apply {
+            background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xCC000000.toInt(), 0x00000000))
+        }, FrameLayout.LayoutParams(-1, dp(120), Gravity.TOP))
+        controles.addView(View(this).apply {
+            background = GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP, intArrayOf(0xCC000000.toInt(), 0x00000000))
+        }, FrameLayout.LayoutParams(-1, dp(150), Gravity.BOTTOM))
+
+        // Arriba: volver · título (EN VIVO / Película · calidad) · motor
+        val arriba = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(12), dp(18), 0)
         }
-    }
+        arriba.addView(boton(R.drawable.ic_rep_volver, "Volver", 46, 0x00000000) { finish() })
+        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(4), 0, 0, 0) }
+        tTitulo = texto(17f, true).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
+        info.addView(tTitulo)
+        val sub = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(4), 0, 0) }
+        tTipo = texto(11f, true).apply { setPadding(dp(7), dp(2), dp(7), dp(2)); setShadowLayer(0f, 0f, 0f, 0) }
+        tCalidad = texto(11f, true).apply {
+            setPadding(dp(7), dp(2), dp(7), dp(2)); setShadowLayer(0f, 0f, 0f, 0)
+            background = pastilla(0x33FFFFFF); visibility = View.GONE
+        }
+        sub.addView(tTipo)
+        sub.addView(tCalidad, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8) })
+        info.addView(sub)
+        arriba.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+        tMotor = texto(12f, true).apply {
+            setPadding(dp(9), dp(4), dp(9), dp(4)); setShadowLayer(0f, 0f, 0f, 0)
+            background = GradientDrawable().apply { cornerRadius = dp(6).toFloat(); setStroke(dp(1), 0x99FFFFFF.toInt()); setColor(0x55000000) }
+            contentDescription = "Motor de reproducción"
+        }
+        arriba.addView(tMotor)
+        controles.addView(arriba, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
 
-    private fun arrancarExo(forzarHls: Boolean?) {
-        cargandoDesde = 0L
-        val http = DefaultHttpDataSource.Factory()
-            .setUserAgent(userAgent)
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(15000)
-            .setReadTimeoutMs(20000)
-            .setKeepPostFor302Redirects(true)
-        val datos = DefaultDataSource.Factory(this, http)
-        val extractores = DefaultExtractorsFactory()
-            .setTsExtractorFlags(
-                DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
-                    DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
-            )
-            .setConstantBitrateSeekingEnabled(true)
-        val fuentes = DefaultMediaSourceFactory(datos, extractores).setLoadErrorHandlingPolicy(Reintentos())
-        val renderers = DefaultRenderersFactory(this)
-            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
-            .setEnableDecoderFallback(true)
-        val bufer = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(20_000, 60_000, 2_500, 5_000)
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .build()
+        // Medio: anterior · -10 · pausa · +10 · siguiente
+        val medio = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        bAnterior = boton(R.drawable.ic_rep_anterior, "Anterior", 54) { cambiarA(indice - 1) }
+        bAtras10 = boton(R.drawable.ic_rep_atras10, "Retroceder 10 segundos", 54) { saltar(-10_000) }
+        bPlay = boton(R.drawable.ic_rep_pausa, "Reproducir o pausar", 78) { alternarPausa() }.apply {
+            background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(0xFFFF3B47.toInt(), 0xFFFF7A45.toInt())).apply { shape = GradientDrawable.OVAL }
+        }
+        bAdelante10 = boton(R.drawable.ic_rep_adelante10, "Adelantar 10 segundos", 54) { saltar(10_000) }
+        bSiguiente = boton(R.drawable.ic_rep_siguiente, "Siguiente", 54) { cambiarA(indice + 1) }
+        listOf(bAnterior, bAtras10, bPlay, bAdelante10, bSiguiente).forEach { medio.addView(it) }
+        controles.addView(medio, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
 
-        val p = ExoPlayer.Builder(this, renderers)
-            .setMediaSourceFactory(fuentes)
-            .setLoadControl(bufer)
-            .build()
-        exo = p
-
-        val v = PlayerView(this).apply {
-            player = p
-            useController = true
-            setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
-            setShowSubtitleButton(true)
-            controllerShowTimeoutMs = 3500
-            keepScreenOn = true
-            setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { vis ->
-                titulo.visibility = vis
-                // El candado aparece y desaparece junto con los controles.
-                if (!bloqueado) candado.visibility = if (vis == View.VISIBLE) View.VISIBLE else View.GONE
-                if (vis != View.VISIBLE) pantallaCompleta()
+        // Abajo: barra de tiempo (o EN VIVO) · audio y subtítulos · formato · bloquear
+        val abajo = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18), 0, dp(18), dp(12)) }
+        filaTiempo = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        tActual = texto(13f).apply { text = "0:00" }
+        tTotal = texto(13f).apply { text = "0:00" }
+        barra = SeekBar(this).apply {
+            max = 1000
+            isFocusable = true
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar, p: Int, delUsuario: Boolean) {
+                    if (delUsuario) { tActual.text = tiempo((duracion() * p / 1000)); mostrarControles() }
+                }
+                override fun onStartTrackingTouch(s: SeekBar) { arrastrandoBarra = true; handler.removeCallbacks(ocultarControlesR) }
+                override fun onStopTrackingTouch(s: SeekBar) { arrastrandoBarra = false; irA(duracion() * s.progress / 1000); mostrarControles() }
             })
-            setOnLongClickListener { cambiarAspecto(); true }
         }
-        vista = v
-        armarVista(v)
+        filaTiempo.addView(tActual)
+        filaTiempo.addView(barra, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6); rightMargin = dp(6) })
+        filaTiempo.addView(tTotal)
+        abajo.addView(filaTiempo)
 
-        // Toda la lista como playlist: los botones anterior/siguiente cambian de canal o
-        // de episodio. El que se fuerza como HLS reemplaza sólo al actual.
-        val medios = items.mapIndexed { i, it ->
-            val forzar = if (i == indice) forzarHls == true else false
-            MediaItem.Builder()
-                .setUri(it.url)
-                .setMimeType(tipoPorUrl(it.url, forzar))
-                .setMediaMetadata(MediaMetadata.Builder().setTitle(it.nombre).build())
-                .build()
+        val fila = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(6), 0, 0) }
+        bVivo = texto(12f, true).apply {
+            text = "●  EN VIVO"
+            setPadding(dp(12), dp(6), dp(12), dp(6)); setShadowLayer(0f, 0f, 0f, 0)
+            background = pastilla(0xFFE53935.toInt())
+            isFocusable = true; isClickable = true
+            contentDescription = "Ir al momento actual"
+            setOnClickListener { irAlVivo(); mostrarControles() }
         }
-        p.setMediaItems(medios, indice, if (itemActual.vivo) C.TIME_UNSET else inicioMs)
-        p.addListener(object : Player.Listener {
-            override fun onPlayerError(error: PlaybackException) = errorExo(error)
-            override fun onPlaybackStateChanged(s: Int) {
-                if (s == Player.STATE_BUFFERING) { if (cargandoDesde == 0L) cargandoDesde = System.currentTimeMillis() }
-                else cargandoDesde = 0L
-                if (s == Player.STATE_READY) { reintentos = 0; yaReprodujo = true; ocultarEstado() }
-                if (s == Player.STATE_ENDED && !itemActual.vivo && indice < items.size - 1) {
-                    /* fin del episodio: el siguiente lo pasa la playlist sola */
-                }
-            }
-            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                val i = p.currentMediaItemIndex
-                if (i in items.indices && i != indice) {
-                    indice = i; inicioMs = 0; reintentos = 0; probeHls = false; probeUa = false; yaReprodujo = false
-                    cargandoDesde = System.currentTimeMillis()
-                    titulo.text = itemActual.nombre
-                    mostrarEstado(itemActual.nombre, 2500)
-                }
-            }
-        })
-        p.playWhenReady = true
-        p.prepare()
-    }
+        fila.addView(bVivo)
+        fila.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        bPistas = boton(R.drawable.ic_rep_pistas, "Audio y subtítulos", 44) { elegirPistas() }
+        bAspecto = boton(R.drawable.ic_rep_aspecto, "Formato de imagen", 44) { cambiarAspecto() }
+        bBloquear = boton(R.drawable.ic_candado_abierto, "Bloquear la pantalla", 44) { alternarBloqueo() }
+        fila.addView(bPistas); fila.addView(bAspecto); fila.addView(bBloquear)
+        abajo.addView(fila)
+        controles.addView(abajo, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
-    private fun errorExo(error: Throwable) {
-        val p = exo ?: return
-        val causa = error.cause
-        // Se quedó atrás del vivo: se vuelve al borde en directo.
-        if (error is PlaybackException && (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW || causa is BehindLiveWindowException)) {
-            p.seekToDefaultPosition(); p.prepare(); return
-        }
-        // Formato que no se reconoce: muchos HLS no terminan en .m3u8 (php, sin extensión).
-        val noReconocido = error is PlaybackException && (
-            error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
-                error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED)
-        if (noReconocido && !probeHls) {
-            probeHls = true
-            mostrarEstado("Probando otro formato…", 0)
-            val pos = p.currentPosition
-            liberarExo()
-            inicioMs = pos
-            arrancarExo(true)
-            return
-        }
-        // El servidor rechazó el pedido (403…): se prueba presentándose como VLC.
-        val rechazado = error is PlaybackException && error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS
-        if (rechazado && !probeUa && userAgent != uaVlc) {
-            probeUa = true
-            userAgent = uaVlc
-            mostrarEstado("Probando otra conexión…", 0)
-            val pos = p.currentPosition
-            liberarExo()
-            inicioMs = if (itemActual.vivo) 0 else pos
-            arrancarExo(probeHls)
-            return
-        }
-        // Cortes de red en vivo: se reintenta un par de veces antes de cambiar de motor.
-        val deRed = error is PlaybackException && error.errorCode in 2000..2999 && !rechazado
-        if (deRed && itemActual.vivo && reintentos < 3) {
-            reintentos++
-            mostrarEstado("Reconectando… ($reintentos)", 0)
-            handler.postDelayed({ exo?.let { it.seekToDefaultPosition(); it.prepare() } }, 1500L * reintentos)
-            return
-        }
-        // Último recurso: VLC, con todos sus códecs.
-        mostrarEstado("Cambiando a VLC…", 0)
-        inicioMs = if (itemActual.vivo) 0 else p.currentPosition
-        liberarExo()
-        arrancarVlc()
-    }
+        // Tocar un lugar vacío de los controles los esconde
+        controles.isClickable = true
+        controles.setOnClickListener { ocultarControles() }
+        raiz.addView(controles, FrameLayout.LayoutParams(-1, -1))
 
-    /**
-     * Vigía:
-     *  - Si un canal que YA estaba reproduciendo se traba cargando más de 12 s, se lo
-     *    reinicia desde el vivo (corte momentáneo de la señal).
-     *  - Si un enlace nunca llega a arrancar en 20 s, no se insiste más con ExoPlayer:
-     *    se pasa a VLC (antes se reiniciaba para siempre y nunca cambiaba de motor).
-     */
-    private val vigia = object : Runnable {
-        override fun run() {
-            val p = exo
-            val cargando = if (cargandoDesde > 0) System.currentTimeMillis() - cargandoDesde else 0L
-            if (p != null && cargando > 0) {
-                if (yaReprodujo && itemActual.vivo && cargando > 12_000) {
-                    cargandoDesde = System.currentTimeMillis()
-                    mostrarEstado("Recuperando la señal…", 2500)
-                    p.seekToDefaultPosition(); p.prepare()
-                } else if (!yaReprodujo && cargando > 20_000) {
-                    cargandoDesde = 0L
-                    mostrarEstado("No arranca con este motor: cambiando a VLC…", 0)
-                    inicioMs = if (itemActual.vivo) 0 else p.currentPosition
-                    liberarExo()
-                    arrancarVlc()
-                }
-            }
-            handler.postDelayed(this, 2000)
+        // Aviso de abajo y porcentaje del medio
+        aviso = texto(14f).apply {
+            setBackgroundColor(0xAA000000.toInt()); setPadding(dp(14), dp(8), dp(14), dp(8)); visibility = View.GONE; setShadowLayer(0f, 0f, 0f, 0)
         }
-    }
-
-    private fun cambiarAspecto() {
-        val v = vista ?: return
-        modoAspecto = (modoAspecto + 1) % 3
-        v.resizeMode = when (modoAspecto) {
-            1 -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-            2 -> AspectRatioFrameLayout.RESIZE_MODE_FILL
-            else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+        raiz.addView(aviso, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(118) })
+        indicador = texto(22f, true).apply {
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(0xAA000000.toInt()) }
+            setPadding(dp(26), dp(14), dp(26), dp(14)); visibility = View.GONE; setShadowLayer(0f, 0f, 0f, 0)
         }
-        mostrarEstado(arrayOf("Imagen: ajustada", "Imagen: recortada (llena la pantalla)", "Imagen: estirada")[modoAspecto], 1800)
-    }
+        raiz.addView(indicador, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
 
-    // ===================== VLC =====================
-
-    private fun arrancarVlc() {
-        try {
-            val opciones = arrayListOf(
-                "--network-caching=3000", "--live-caching=3000", "--file-caching=3000",
-                "--http-reconnect", "--clock-jitter=0", "--clock-synchro=0",
-                "--audio-time-stretch", "--avcodec-skiploopfilter=1", "--no-stats"
-            )
-            val lib = LibVLC(this, opciones)
-            libVlc = lib
-            val mp = org.videolan.libvlc.MediaPlayer(lib)
-            vlc = mp
-            val capa = VLCVideoLayout(this)
-            vlcVista = capa
-            armarVista(capa)
-            mp.attachViews(capa, null, false, false)
-            val m = Media(lib, Uri.parse(itemActual.url))
-            m.setHWDecoderEnabled(true, false)
-            m.addOption(":http-user-agent=$userAgent")
-            m.addOption(":network-caching=3000")
-            mp.media = m
-            m.release()
-            mp.setEventListener { e ->
-                when (e.type) {
-                    org.videolan.libvlc.MediaPlayer.Event.Buffering ->
-                        cargando.visibility = if (e.buffering < 100f) View.VISIBLE else View.GONE
-                    org.videolan.libvlc.MediaPlayer.Event.Playing -> {
-                        cargando.visibility = View.GONE; ocultarEstado()
-                        if (inicioMs > 0) { mp.time = inicioMs; inicioMs = 0 }
-                    }
-                    org.videolan.libvlc.MediaPlayer.Event.EncounteredError ->
-                        mostrarEstado("No se pudo reproducir este enlace. Probá otro servidor o canal.", 0)
-                    org.videolan.libvlc.MediaPlayer.Event.EndReached ->
-                        if (!itemActual.vivo && indice < items.size - 1) cambiarA(indice + 1)
-                }
-            }
-            crearControlesVlc(mp)
-            // Tocar la imagen muestra u oculta los controles (como en ExoPlayer).
-            capa.setOnClickListener { if (vlcControles?.visibility == View.VISIBLE) ocultarControlesVlc() else mostrarControlesVlc() }
-            capa.setOnLongClickListener { cambiarAspectoVlc(); true }
-            cargando.visibility = View.VISIBLE
-            mp.play()
-            mostrarEstado("Reproduciendo con VLC", 2000)
-        } catch (e: Throwable) {
-            mostrarEstado("No se pudo abrir el reproductor VLC.", 0)
-        }
-    }
-
-    /** Controles cuando reproduce VLC: anterior, -10 s, pausa, +10 s, siguiente y barra de tiempo. */
-    private fun crearControlesVlc(mp: org.videolan.libvlc.MediaPlayer) {
-        val ov = FrameLayout(this).apply {
-            setBackgroundColor(0x66000000)
+        // Candado de la pantalla bloqueada
+        candado = ImageView(this).apply {
+            setImageResource(R.drawable.ic_candado)
+            background = circulo(0x99000000.toInt())
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            contentDescription = "Desbloquear la pantalla"
             visibility = View.GONE
             isClickable = true
-            setOnClickListener { ocultarControlesVlc() }
+            setOnClickListener { alternarBloqueo() }
         }
-        fun boton(icono: Int, desc: String, tam: Int, accion: () -> Unit) = ImageButton(this).apply {
-            setImageResource(icono)
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0x55000000) }
-            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            contentDescription = desc
-            isFocusable = true
-            layoutParams = LinearLayout.LayoutParams(dp(tam), dp(tam)).apply { leftMargin = dp(10); rightMargin = dp(10) }
-            setOnClickListener { accion(); mostrarControlesVlc() }
-        }
-        val fila = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        if (items.size > 1) fila.addView(boton(android.R.drawable.ic_media_previous, "Anterior", 58) { cambiarA(indice - 1) })
-        if (!itemActual.vivo) fila.addView(boton(android.R.drawable.ic_media_rew, "Atrasar 10 segundos", 58) { mp.time = (mp.time - 10_000).coerceAtLeast(0) })
-        val play = boton(android.R.drawable.ic_media_pause, "Pausa", 76) { if (mp.isPlaying) mp.pause() else mp.play() }
-        vlcPlay = play
-        fila.addView(play)
-        if (!itemActual.vivo) fila.addView(boton(android.R.drawable.ic_media_ff, "Adelantar 10 segundos", 58) { mp.time = mp.time + 10_000 })
-        if (items.size > 1) fila.addView(boton(android.R.drawable.ic_media_next, "Siguiente", 58) { cambiarA(indice + 1) })
-        ov.addView(fila, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-
-        if (!itemActual.vivo) {
-            val abajo = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(20), 0, dp(20), dp(18))
-            }
-            val tiempo = TextView(this).apply { setTextColor(Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f); text = "00:00 / 00:00" }
-            val barra = SeekBar(this).apply {
-                max = 1000
-                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(s: SeekBar, p: Int, delUsuario: Boolean) {}
-                    override fun onStartTrackingTouch(s: SeekBar) { arrastrandoBarra = true; handler.removeCallbacks(ocultarVlc) }
-                    override fun onStopTrackingTouch(s: SeekBar) { arrastrandoBarra = false; mp.position = s.progress / 1000f; mostrarControlesVlc() }
-                })
-            }
-            vlcTiempo = tiempo; vlcBarra = barra
-            abajo.addView(tiempo, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            abajo.addView(barra, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(12) })
-            ov.addView(abajo, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
-        }
-        vlcControles = ov
-        raiz.addView(ov, 1, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        handler.removeCallbacks(actualizarVlc)
-        handler.post(actualizarVlc)
+        raiz.addView(candado, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER))
     }
 
-    private val ocultarVlc = Runnable { ocultarControlesVlc() }
-    private fun mostrarControlesVlc() {
-        val ov = vlcControles ?: return
+    /** Se acomodan los controles según lo que se reproduce (en vivo o película). */
+    private fun acomodarControles() {
+        val vivo = itemActual.vivo
+        tTitulo.text = itemActual.nombre
+        tTipo.text = if (vivo) "EN VIVO" else "PELÍCULA / SERIE"
+        tTipo.background = pastilla(if (vivo) 0xFFE53935.toInt() else 0x33FFFFFF)
+        bAtras10.visibility = if (vivo) View.GONE else View.VISIBLE
+        bAdelante10.visibility = if (vivo) View.GONE else View.VISIBLE
+        filaTiempo.visibility = if (vivo) View.GONE else View.VISIBLE
+        bVivo.visibility = if (vivo && exo != null) View.VISIBLE else View.GONE
+        val varios = items.size > 1
+        bAnterior.visibility = if (varios) View.VISIBLE else View.GONE
+        bSiguiente.visibility = if (varios) View.VISIBLE else View.GONE
+        bAnterior.isEnabled = indice > 0; bAnterior.alpha = if (indice > 0) 1f else 0.35f
+        bSiguiente.isEnabled = indice < items.size - 1; bSiguiente.alpha = if (indice < items.size - 1) 1f else 0.35f
+        tMotor.text = if (vlc != null) "VLC" else "EXO"
+        tCalidad.visibility = View.GONE
+    }
+
+    private val ocultarControlesR = Runnable { ocultarControles() }
+    private fun mostrarControles() {
         if (bloqueado) return
-        ov.visibility = View.VISIBLE
-        titulo.visibility = View.VISIBLE
-        candado.visibility = View.VISIBLE
-        handler.removeCallbacks(ocultarVlc)
-        if (!arrastrandoBarra) handler.postDelayed(ocultarVlc, 3500)
+        controles.visibility = View.VISIBLE
+        handler.removeCallbacks(ocultarControlesR)
+        if (!arrastrandoBarra) handler.postDelayed(ocultarControlesR, 4000)
     }
-    private fun ocultarControlesVlc() {
-        vlcControles?.visibility = View.GONE
-        titulo.visibility = View.GONE
-        if (!bloqueado) candado.visibility = View.GONE
-        handler.removeCallbacks(ocultarVlc)
+    private fun ocultarControles() {
+        controles.visibility = View.GONE
+        handler.removeCallbacks(ocultarControlesR)
         pantallaCompleta()
     }
-    private fun formatoTiempo(ms: Long): String {
-        val s = (ms / 1000).coerceAtLeast(0)
-        val h = s / 3600; val m = (s % 3600) / 60; val ss = s % 60
-        return if (h > 0) String.format("%d:%02d:%02d", h, m, ss) else String.format("%02d:%02d", m, ss)
-    }
-    private val actualizarVlc = object : Runnable {
+    private fun alternarControles() { if (controles.visibility == View.VISIBLE) ocultarControles() else mostrarControles() }
+
+    /** Cada medio segundo: pausa/reproducir, tiempo y calidad real de la imagen. */
+    private val actualizar = object : Runnable {
         override fun run() {
-            val mp = vlc ?: return
-            vlcPlay?.setImageResource(if (mp.isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
-            val total = mp.length
-            if (total > 0 && !arrastrandoBarra) {
-                vlcBarra?.progress = (mp.position * 1000).toInt()
-                vlcTiempo?.text = formatoTiempo(mp.time) + " / " + formatoTiempo(total)
+            val reproduciendo = exo?.isPlaying ?: (vlc?.isPlaying ?: false)
+            bPlay.setImageResource(if (reproduciendo || exo?.playWhenReady == true && vlc == null && exo?.playbackState == Player.STATE_BUFFERING) R.drawable.ic_rep_pausa else R.drawable.ic_rep_play)
+            if (!itemActual.vivo && !arrastrandoBarra) {
+                val d = duracion(); val pos = posicion()
+                if (d > 0) {
+                    barra.progress = (pos * 1000 / d).toInt()
+                    tActual.text = tiempo(pos); tTotal.text = tiempo(d)
+                }
             }
+            val (w, h) = tamanoVideo()
+            val q = etiquetaCalidad(w, h)
+            if (q.isNotEmpty()) { tCalidad.text = q; tCalidad.visibility = View.VISIBLE }
             handler.postDelayed(this, 500)
         }
     }
 
-    // ===================== Bloqueo de pantalla =====================
+    private fun tiempo(ms: Long): String {
+        val s = (ms / 1000).coerceAtLeast(0)
+        val h = s / 3600; val m = (s % 3600) / 60; val ss = s % 60
+        return if (h > 0) String.format("%d:%02d:%02d", h, m, ss) else String.format("%d:%02d", m, ss)
+    }
+
+    /** Igual que el reproductor de antes: sale del tamaño real de la imagen que llega. */
+    private fun etiquetaCalidad(w: Int, h: Int): String {
+        if (h <= 0) return ""
+        val m = maxOf(h, w * 9 / 16)
+        return when {
+            m >= 2000 -> "4K"
+            m >= 1300 -> "2K"
+            m >= 1000 -> "FHD 1080p"
+            m >= 700 -> "HD 720p"
+            else -> "SD ${h}p"
+        }
+    }
+
+    private fun tamanoVideo(): Pair<Int, Int> {
+        exo?.let { return Pair(it.videoSize.width, it.videoSize.height) }
+        try {
+            val t = vlc?.currentVideoTrack
+            if (t != null) return Pair(t.width, t.height)
+        } catch (e: Throwable) { }
+        return Pair(0, 0)
+    }
+
+    // ============================================================
+    // Acciones comunes a los dos motores
+    // ============================================================
+
+    private fun posicion(): Long = exo?.currentPosition ?: (vlc?.time ?: 0L)
+    private fun duracion(): Long {
+        exo?.let { val d = it.duration; return if (d == C.TIME_UNSET || d < 0) 0L else d }
+        return vlc?.length?.coerceAtLeast(0L) ?: 0L
+    }
+    private fun irA(ms: Long) { exo?.seekTo(ms) ?: vlc?.let { it.time = ms } }
+    private fun saltar(delta: Long) {
+        if (itemActual.vivo) return
+        irA((posicion() + delta).coerceIn(0L, maxOf(0L, duracion())))
+        mostrarIndicador(if (delta > 0) "+10 s" else "−10 s", 600)
+    }
+    private fun alternarPausa() {
+        exo?.let { if (it.isPlaying) it.pause() else it.play(); return }
+        vlc?.let { if (it.isPlaying) it.pause() else it.play() }
+    }
+    private fun irAlVivo() { exo?.let { it.seekToDefaultPosition(); it.play() } }
+
+    private fun cambiarAspecto() {
+        modoAspecto = (modoAspecto + 1) % 3
+        vista?.resizeMode = when (modoAspecto) {
+            1 -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            2 -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+            else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+        }
+        vlc?.videoScale = when (modoAspecto) {
+            1 -> org.videolan.libvlc.MediaPlayer.ScaleType.SURFACE_FILL
+            2 -> org.videolan.libvlc.MediaPlayer.ScaleType.SURFACE_FIT_SCREEN
+            else -> org.videolan.libvlc.MediaPlayer.ScaleType.SURFACE_BEST_FIT
+        }
+        mostrarIndicador(arrayOf("Ajustada", "Llenar pantalla", "Estirada")[modoAspecto], 1200)
+    }
+
+    /** Audio y subtítulos: lista simple con las pistas que trae el canal o la película. */
+    private fun elegirPistas() {
+        val nombres = mutableListOf<String>()
+        val acciones = mutableListOf<() -> Unit>()
+        val p = exo
+        val mp = vlc
+        if (p != null) {
+            for (g in p.currentTracks.groups) {
+                if (g.type != C.TRACK_TYPE_AUDIO && g.type != C.TRACK_TYPE_TEXT) continue
+                for (i in 0 until g.length) {
+                    if (!g.isTrackSupported(i)) continue
+                    val f = g.getTrackFormat(i)
+                    val nombre = f.label ?: f.language?.let { java.util.Locale(it).displayLanguage.replaceFirstChar { c -> c.uppercase() } } ?: "Pista ${i + 1}"
+                    val elegido = if (g.isTrackSelected(i)) "  ✓" else ""
+                    val tipo = if (g.type == C.TRACK_TYPE_AUDIO) "Audio" else "Subtítulos"
+                    nombres.add("$tipo: $nombre$elegido")
+                    val grupo = g.mediaTrackGroup; val idx = i; val t = g.type
+                    acciones.add {
+                        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
+                            .setTrackTypeDisabled(t, false)
+                            .setOverrideForType(TrackSelectionOverride(grupo, idx))
+                            .build()
+                    }
+                }
+            }
+            if (nombres.any { it.startsWith("Subtítulos") }) {
+                nombres.add("Subtítulos: desactivados")
+                acciones.add { p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build() }
+            }
+        } else if (mp != null) {
+            try {
+                mp.audioTracks?.forEach { t ->
+                    nombres.add("Audio: ${t.name}" + if (t.id == mp.audioTrack) "  ✓" else ""); acciones.add { mp.audioTrack = t.id }
+                }
+                mp.spuTracks?.forEach { t ->
+                    nombres.add("Subtítulos: ${t.name}" + if (t.id == mp.spuTrack) "  ✓" else ""); acciones.add { mp.spuTrack = t.id }
+                }
+            } catch (e: Throwable) { }
+        }
+        if (nombres.isEmpty()) { mostrarIndicador("Este contenido trae\nun solo audio", 1500); return }
+        handler.removeCallbacks(ocultarControlesR)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Audio y subtítulos")
+            .setItems(nombres.toTypedArray()) { _, i -> acciones[i](); mostrarControles() }
+            .setOnDismissListener { pantallaCompleta(); mostrarControles() }
+            .show()
+    }
+
+    // ============================================================
+    // Bloqueo de pantalla
+    // ============================================================
 
     private val ocultarCandado = Runnable { if (bloqueado) candado.visibility = View.GONE }
 
     private fun alternarBloqueo() {
         if (!bloqueado) {
             bloqueado = true
-            vista?.hideController()
-            vista?.useController = false
-            vlcControles?.visibility = View.GONE
-            titulo.visibility = View.GONE
-            candado.setImageResource(R.drawable.ic_candado)
-            candado.contentDescription = "Desbloquear la pantalla"
+            ocultarControles()
             candado.visibility = View.GONE
             mostrarIndicador("Pantalla bloqueada", 1200)
         } else {
             bloqueado = false
             handler.removeCallbacks(ocultarCandado)
-            candado.setImageResource(R.drawable.ic_candado_abierto)
-            candado.contentDescription = "Bloquear la pantalla"
-            vista?.useController = true
-            vista?.showController()
-            mostrarControlesVlc()
-            candado.visibility = View.VISIBLE
+            candado.visibility = View.GONE
             mostrarIndicador("Pantalla desbloqueada", 1000)
+            mostrarControles()
         }
     }
 
-    // ===================== Gestos y avisos centrales =====================
+    // ============================================================
+    // Toques: bloqueo, gestos de volumen/brillo y mostrar controles
+    // ============================================================
 
     private val ocultarIndicador = Runnable { indicador.visibility = View.GONE }
-    private fun mostrarIndicador(texto: String, duracionMs: Long) {
-        indicador.text = texto
+    private fun mostrarIndicador(t: String, duracionMs: Long) {
+        indicador.text = t
         indicador.visibility = View.VISIBLE
         handler.removeCallbacks(ocultarIndicador)
         if (duracionMs > 0) handler.postDelayed(ocultarIndicador, duracionMs)
@@ -606,14 +562,8 @@ class PlayerActivity : Activity() {
         return try { Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS) / 255f } catch (e: Exception) { 0.5f }
     }
 
-    /**
-     * Toques:
-     *  - Pantalla bloqueada: nada llega al reproductor; tocar en cualquier parte muestra el
-     *    candado unos segundos, y tocar el candado desbloquea.
-     *  - Teléfono: deslizar hacia arriba o abajo del lado izquierdo cambia el volumen, del
-     *    lado derecho el brillo. Sólo se ve el porcentaje en el medio. (En la TV no.)
-     */
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        // Pantalla bloqueada: sólo el candado responde; tocar en otro lado lo muestra.
         if (bloqueado) {
             if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
                 toqueEnCandado = dentroDe(candado, ev)
@@ -629,16 +579,11 @@ class PlayerActivity : Activity() {
             val alto = raiz.height.toFloat().coerceAtLeast(1f)
             val ancho = raiz.width.toFloat().coerceAtLeast(1f)
             when (ev.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    gx = ev.x; gy = ev.y; gesto = 0
-                }
+                MotionEvent.ACTION_DOWN -> { gx = ev.x; gy = ev.y; gesto = 0 }
                 MotionEvent.ACTION_MOVE -> {
-                    val dy = ev.y - gy
-                    val dx = ev.x - gx
-                    // Empieza un gesto vertical: no desde los bordes de arriba y abajo
-                    // (barra de tiempo y barras del sistema), ni desde el medio exacto.
+                    val dy = ev.y - gy; val dx = ev.x - gx
                     if (gesto == 0 && Math.abs(dy) > dp(18) && Math.abs(dy) > Math.abs(dx) * 1.6f &&
-                        gy > alto * 0.12f && gy < alto * 0.85f && Math.abs(gx - ancho / 2) > ancho * 0.08f
+                        gy > alto * 0.15f && gy < alto * 0.80f && Math.abs(gx - ancho / 2) > ancho * 0.12f
                     ) {
                         gesto = if (gx < ancho / 2) 1 else 2
                         gy = ev.y
@@ -677,88 +622,292 @@ class PlayerActivity : Activity() {
         return super.dispatchTouchEvent(ev)
     }
 
-    private fun cambiarAspectoVlc() {
-        val mp = vlc ?: return
-        modoAspecto = (modoAspecto + 1) % 3
-        when (modoAspecto) {
-            1 -> mp.videoScale = org.videolan.libvlc.MediaPlayer.ScaleType.SURFACE_FILL
-            2 -> mp.videoScale = org.videolan.libvlc.MediaPlayer.ScaleType.SURFACE_FIT_SCREEN
-            else -> mp.videoScale = org.videolan.libvlc.MediaPlayer.ScaleType.SURFACE_BEST_FIT
-        }
-        mostrarEstado(arrayOf("Imagen: ajustada", "Imagen: llena la pantalla", "Imagen: estirada")[modoAspecto], 1800)
-    }
-
-    // ===================== Cambio de canal / episodio =====================
-
-    private fun cambiarA(nuevo: Int) {
-        if (nuevo !in items.indices) return
-        // Con ExoPlayer la playlist ya lo resuelve.
-        val p = exo
-        if (p != null) { p.seekTo(nuevo, if (items[nuevo].vivo) C.TIME_UNSET else 0L); p.prepare(); p.play(); return }
-        indice = nuevo; inicioMs = 0
-        arrancar()
-        mostrarEstado(itemActual.nombre, 2500)
-    }
+    // ============================================================
+    // Teclas (control remoto de la TV)
+    // ============================================================
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        val controlesVisibles = vista?.isControllerFullyVisible == true
+        if (bloqueado && keyCode != KeyEvent.KEYCODE_BACK) return true
+        val visibles = controles.visibility == View.VISIBLE
         when (keyCode) {
             KeyEvent.KEYCODE_CHANNEL_UP -> { cambiarA(indice + 1); return true }
             KeyEvent.KEYCODE_CHANNEL_DOWN -> { cambiarA(indice - 1); return true }
-            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
-                // En vivo, con los controles escondidos, arriba/abajo cambia de canal (como un TV).
-                if (itemActual.vivo && !controlesVisibles && items.size > 1) {
-                    cambiarA(if (keyCode == KeyEvent.KEYCODE_DPAD_UP) indice - 1 else indice + 1)
-                    return true
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE -> { alternarPausa(); mostrarControles(); return true }
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { saltar(10_000); return true }
+            KeyEvent.KEYCODE_MEDIA_REWIND -> { saltar(-10_000); return true }
+            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_INFO -> { cambiarAspecto(); return true }
+        }
+        if (!visibles) {
+            when (keyCode) {
+                // Controles escondidos: arriba/abajo cambia de canal en vivo (como un TV);
+                // izquierda/derecha atrasa o adelanta en películas; OK muestra los controles.
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                    if (itemActual.vivo && items.size > 1) { cambiarA(if (keyCode == KeyEvent.KEYCODE_DPAD_UP) indice - 1 else indice + 1); return true }
+                    mostrarControles(); bPlay.requestFocus(); return true
                 }
-            }
-            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                val mp = vlc
-                if (mp != null && !itemActual.vivo) {
-                    mp.time = (mp.time + if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) 10_000 else -10_000).coerceAtLeast(0)
-                    return true
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    if (!itemActual.vivo) { saltar(if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) 10_000 else -10_000); return true }
+                    mostrarControles(); bPlay.requestFocus(); return true
                 }
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { mostrarControles(); bPlay.requestFocus(); return true }
             }
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                val mp = vlc
-                if (mp != null) { if (mp.isPlaying) mp.pause() else mp.play(); return true }
-            }
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                val ov = vlcControles
-                // VLC: OK muestra los controles; con los controles a la vista, OK activa el botón elegido.
-                if (ov != null && ov.visibility != View.VISIBLE) { mostrarControlesVlc(); vlcPlay?.requestFocus(); return true }
-                if (ov != null) { mostrarControlesVlc() }
-                else if (vista != null && !controlesVisibles) { vista?.showController(); return true }
-            }
-            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_INFO -> { if (vlc != null) cambiarAspectoVlc() else cambiarAspecto(); return true }
+        } else if (keyCode != KeyEvent.KEYCODE_BACK) {
+            mostrarControles()
         }
         return super.onKeyDown(keyCode, event)
     }
 
-    // ===================== Vista y avisos =====================
+    // ============================================================
+    // Elección del motor
+    // ============================================================
 
-    private fun armarVista(v: View) {
-        raiz.removeAllViews()
-        raiz.addView(v, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        raiz.addView(titulo, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
-        raiz.addView(estado, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(70) })
-        raiz.addView(cargando, FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER))
-        raiz.addView(indicador, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-        raiz.addView(candado, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.START or Gravity.CENTER_VERTICAL).apply { leftMargin = dp(26) })
-        titulo.visibility = View.GONE
-        vlcControles = null; vlcPlay = null; vlcBarra = null; vlcTiempo = null
+    private fun arrancar() {
+        liberarTodo()
+        reintentos = 0; probeHls = false; probeUa = false; yaReprodujo = false; cargandoDesde = 0L
+        val esquema = Uri.parse(itemActual.url).scheme?.lowercase() ?: ""
+        if (esquema in setOf("udp", "rtp", "mms", "mmsh", "srt", "rtmps")) arrancarVlc() else arrancarExo(null)
+        acomodarControles()
+        mostrarControles()
     }
 
-    private val ocultar = Runnable { estado.visibility = View.GONE }
-    private fun mostrarEstado(texto: String, duracionMs: Long) {
-        estado.text = texto
-        estado.visibility = View.VISIBLE
-        handler.removeCallbacks(ocultar)
-        if (duracionMs > 0) handler.postDelayed(ocultar, duracionMs)
+    private fun ponerVideo(v: View) {
+        capaVideo.removeAllViews()
+        capaVideo.addView(v, FrameLayout.LayoutParams(-1, -1))
     }
-    private fun ocultarEstado() { handler.removeCallbacks(ocultar); estado.visibility = View.GONE }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    // ============================================================
+    // ExoPlayer
+    // ============================================================
+
+    /** Reintentos con espera creciente; ante 403/404 o formato inválido, no se insiste. */
+    private inner class Reintentos : DefaultLoadErrorHandlingPolicy() {
+        override fun getMinimumLoadableRetryCount(dataType: Int): Int = if (itemActual.vivo) 6 else 4
+        override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+            val e = loadErrorInfo.exception
+            if (e is HttpDataSource.InvalidResponseCodeException && e.responseCode in 400..499) return C.TIME_UNSET
+            if (e is ParserException) return C.TIME_UNSET
+            return (loadErrorInfo.errorCount * 1000L).coerceAtMost(4000L)
+        }
+    }
+
+    private fun tipoPorUrl(url: String, forzarHls: Boolean): String? {
+        if (forzarHls) return MimeTypes.APPLICATION_M3U8
+        val ruta = Uri.parse(url).path?.lowercase() ?: url.lowercase()
+        return when {
+            ruta.endsWith(".m3u8") || ruta.endsWith(".m3u") || url.contains("type=m3u8") -> MimeTypes.APPLICATION_M3U8
+            ruta.endsWith(".mpd") -> MimeTypes.APPLICATION_MPD
+            Uri.parse(url).scheme.equals("rtsp", true) -> MimeTypes.APPLICATION_RTSP
+            else -> null
+        }
+    }
+
+    private fun arrancarExo(forzarHls: Boolean?) {
+        cargandoDesde = 0L
+        val http = DefaultHttpDataSource.Factory()
+            .setUserAgent(userAgent)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(15000)
+            .setReadTimeoutMs(20000)
+            .setKeepPostFor302Redirects(true)
+        val datos = DefaultDataSource.Factory(this, http)
+        val extractores = DefaultExtractorsFactory()
+            .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS)
+            .setConstantBitrateSeekingEnabled(true)
+        val fuentes = DefaultMediaSourceFactory(datos, extractores).setLoadErrorHandlingPolicy(Reintentos())
+        val renderers = DefaultRenderersFactory(this)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+            .setEnableDecoderFallback(true)
+        val bufer = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(20_000, 60_000, 2_500, 5_000)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+        val p = ExoPlayer.Builder(this, renderers).setMediaSourceFactory(fuentes).setLoadControl(bufer).build()
+        exo = p
+
+        val v = PlayerView(this).apply {
+            player = p
+            useController = false                 // los controles son los propios de JhaKet
+            setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
+            keepScreenOn = true
+            resizeMode = when (modoAspecto) {
+                1 -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                2 -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+                else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+            }
+        }
+        vista = v
+        ponerVideo(v)
+
+        val medios = items.mapIndexed { i, it ->
+            MediaItem.Builder()
+                .setUri(it.url)
+                .setMimeType(tipoPorUrl(it.url, i == indice && forzarHls == true))
+                .setMediaMetadata(MediaMetadata.Builder().setTitle(it.nombre).build())
+                .build()
+        }
+        p.setMediaItems(medios, indice, if (itemActual.vivo) C.TIME_UNSET else inicioMs)
+        p.addListener(object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) = errorExo(error)
+            override fun onPlaybackStateChanged(s: Int) {
+                if (s == Player.STATE_BUFFERING) { if (cargandoDesde == 0L) cargandoDesde = System.currentTimeMillis() } else cargandoDesde = 0L
+                if (s == Player.STATE_READY) { reintentos = 0; yaReprodujo = true; ocultarAviso() }
+            }
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                val i = p.currentMediaItemIndex
+                if (i in items.indices && i != indice) {
+                    indice = i; inicioMs = 0; reintentos = 0; probeHls = false; probeUa = false; yaReprodujo = false
+                    cargandoDesde = System.currentTimeMillis()
+                    acomodarControles()
+                    mostrarIndicador(itemActual.nombre, 1500)
+                }
+            }
+        })
+        p.playWhenReady = true
+        p.prepare()
+    }
+
+    private fun errorExo(error: PlaybackException) {
+        val p = exo ?: return
+        if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW || error.cause is BehindLiveWindowException) {
+            p.seekToDefaultPosition(); p.prepare(); return
+        }
+        val noReconocido = error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
+            error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED
+        if (noReconocido && !probeHls) {
+            probeHls = true
+            mostrarAviso("Probando otro formato…", 0)
+            reiniciarExo(true); return
+        }
+        val rechazado = error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS
+        if (rechazado && !probeUa && userAgent != uaVlc) {
+            probeUa = true
+            userAgent = uaVlc
+            mostrarAviso("Probando otra conexión…", 0)
+            reiniciarExo(probeHls); return
+        }
+        val deRed = error.errorCode in 2000..2999 && !rechazado
+        if (deRed && itemActual.vivo && reintentos < 3) {
+            reintentos++
+            mostrarAviso("Reconectando… ($reintentos)", 0)
+            handler.postDelayed({ exo?.let { it.seekToDefaultPosition(); it.prepare() } }, 1500L * reintentos)
+            return
+        }
+        pasarAVlc("Cambiando a VLC…")
+    }
+
+    private fun reiniciarExo(forzarHls: Boolean) {
+        val pos = exo?.currentPosition ?: 0L
+        liberarExo()
+        inicioMs = if (itemActual.vivo) 0 else pos
+        arrancarExo(forzarHls)
+        acomodarControles()
+    }
+
+    private fun pasarAVlc(motivo: String) {
+        mostrarAviso(motivo, 0)
+        inicioMs = if (itemActual.vivo) 0 else (exo?.currentPosition ?: 0L)
+        liberarExo()
+        arrancarVlc()
+        acomodarControles()
+    }
+
+    /**
+     * Vigía: si un canal que ya estaba andando se traba más de 12 s, se lo reinicia desde
+     * el vivo. Si un enlace nunca arranca en 20 s, se pasa a VLC.
+     */
+    private val vigia = object : Runnable {
+        override fun run() {
+            val p = exo
+            val espera = if (cargandoDesde > 0) System.currentTimeMillis() - cargandoDesde else 0L
+            if (p != null && espera > 0) {
+                if (yaReprodujo && itemActual.vivo && espera > 12_000) {
+                    cargandoDesde = System.currentTimeMillis()
+                    mostrarAviso("Recuperando la señal…", 2500)
+                    p.seekToDefaultPosition(); p.prepare()
+                } else if (!yaReprodujo && espera > 20_000) {
+                    cargandoDesde = 0L
+                    pasarAVlc("No arranca con EXO: cambiando a VLC…")
+                }
+            }
+            handler.postDelayed(this, 2000)
+        }
+    }
+
+    // ============================================================
+    // VLC
+    // ============================================================
+
+    private fun arrancarVlc() {
+        try {
+            val lib = LibVLC(this, arrayListOf(
+                "--network-caching=3000", "--live-caching=3000", "--file-caching=3000",
+                "--http-reconnect", "--clock-jitter=0", "--clock-synchro=0",
+                "--audio-time-stretch", "--avcodec-skiploopfilter=1", "--no-stats"
+            ))
+            libVlc = lib
+            val mp = org.videolan.libvlc.MediaPlayer(lib)
+            vlc = mp
+            val capa = VLCVideoLayout(this)
+            ponerVideo(capa)
+            mp.attachViews(capa, null, false, false)
+            val m = Media(lib, Uri.parse(itemActual.url))
+            m.setHWDecoderEnabled(true, false)
+            m.addOption(":http-user-agent=$userAgent")
+            m.addOption(":network-caching=3000")
+            mp.media = m
+            m.release()
+            mp.videoScale = when (modoAspecto) {
+                1 -> org.videolan.libvlc.MediaPlayer.ScaleType.SURFACE_FILL
+                2 -> org.videolan.libvlc.MediaPlayer.ScaleType.SURFACE_FIT_SCREEN
+                else -> org.videolan.libvlc.MediaPlayer.ScaleType.SURFACE_BEST_FIT
+            }
+            mp.setEventListener { e ->
+                when (e.type) {
+                    org.videolan.libvlc.MediaPlayer.Event.Buffering -> cargando.visibility = if (e.buffering < 100f) View.VISIBLE else View.GONE
+                    org.videolan.libvlc.MediaPlayer.Event.Playing -> {
+                        cargando.visibility = View.GONE; ocultarAviso()
+                        if (inicioMs > 0) { mp.time = inicioMs; inicioMs = 0 }
+                    }
+                    org.videolan.libvlc.MediaPlayer.Event.EncounteredError -> {
+                        cargando.visibility = View.GONE
+                        mostrarAviso("No se pudo reproducir este enlace. Probá otro servidor o canal.", 0)
+                    }
+                    org.videolan.libvlc.MediaPlayer.Event.EndReached ->
+                        if (!itemActual.vivo && indice < items.size - 1) cambiarA(indice + 1)
+                }
+            }
+            cargando.visibility = View.VISIBLE
+            mp.play()
+        } catch (e: Throwable) {
+            mostrarAviso("No se pudo abrir VLC.", 0)
+        }
+    }
+
+    // ============================================================
+    // Cambio de canal o episodio
+    // ============================================================
+
+    private fun cambiarA(nuevo: Int) {
+        if (nuevo !in items.indices) return
+        val p = exo
+        if (p != null) { p.seekTo(nuevo, if (items[nuevo].vivo) C.TIME_UNSET else 0L); p.prepare(); p.play(); return }
+        indice = nuevo; inicioMs = 0
+        arrancar()                     // con VLC andando, el nuevo vuelve a probar EXO primero
+        mostrarIndicador(itemActual.nombre, 1500)
+    }
+
+    // ============================================================
+    // Avisos, pantalla completa y ciclo de vida
+    // ============================================================
+
+    private val ocultarAvisoR = Runnable { aviso.visibility = View.GONE }
+    private fun mostrarAviso(t: String, duracionMs: Long) {
+        aviso.text = t
+        aviso.visibility = View.VISIBLE
+        handler.removeCallbacks(ocultarAvisoR)
+        if (duracionMs > 0) handler.postDelayed(ocultarAvisoR, duracionMs)
+    }
+    private fun ocultarAviso() { handler.removeCallbacks(ocultarAvisoR); aviso.visibility = View.GONE }
 
     @Suppress("DEPRECATION")
     private fun pantallaCompleta() {
@@ -782,29 +931,16 @@ class PlayerActivity : Activity() {
         if (hasFocus) pantallaCompleta()
     }
 
-    // ===================== Ciclo de vida =====================
-
-    override fun onPause() {
-        super.onPause()
-        exo?.pause()
-        vlc?.pause()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        pantallaCompleta()
-        exo?.play()
-        vlc?.play()
-    }
+    override fun onPause() { super.onPause(); exo?.pause(); vlc?.pause() }
+    override fun onResume() { super.onResume(); pantallaCompleta(); exo?.play(); vlc?.play() }
 
     override fun finish() {
-        // Posición para "Continuar viendo" (sólo películas y episodios).
         try {
             if (items.isNotEmpty() && !itemActual.vivo) {
-                val pos: Long; val dur: Long
-                val p = exo; val mp = vlc
-                if (p != null) { pos = p.currentPosition; dur = p.duration } else if (mp != null) { pos = mp.time; dur = mp.length } else { pos = 0; dur = 0 }
-                setResult(RESULT_OK, Intent().putExtra("url", itemActual.url).putExtra("pos", pos / 1000.0).putExtra("dur", if (dur > 0) dur / 1000.0 else 0.0))
+                setResult(RESULT_OK, Intent()
+                    .putExtra("url", itemActual.url)
+                    .putExtra("pos", posicion() / 1000.0)
+                    .putExtra("dur", duracion() / 1000.0))
             }
         } catch (e: Exception) { }
         super.finish()
@@ -826,7 +962,6 @@ class PlayerActivity : Activity() {
         vlc = null
         try { libVlc?.release() } catch (e: Throwable) { }
         libVlc = null
-        vlcVista = null
     }
 
     private fun liberarTodo() { liberarExo(); liberarVlc() }
