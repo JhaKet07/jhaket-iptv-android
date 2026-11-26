@@ -78,7 +78,7 @@ import org.videolan.libvlc.util.VLCVideoLayout
 @OptIn(UnstableApi::class)
 class PlayerActivity : Activity() {
 
-    private data class Item(val url: String, val nombre: String, val vivo: Boolean)
+    private data class Item(val url: String, val nombre: String, val vivo: Boolean, val logo: String = "")
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var raiz: FrameLayout
@@ -90,6 +90,9 @@ class PlayerActivity : Activity() {
     // Controles
     private lateinit var controles: FrameLayout
     private lateinit var tTitulo: TextView
+    private lateinit var iLogo: ImageView
+    /** Logos ya descargados (al cambiar de canal no se vuelven a bajar). */
+    private val logos = HashMap<String, android.graphics.Bitmap?>()
     private lateinit var tTipo: TextView
     private lateinit var tCalidad: TextView
     private lateinit var tMotor: TextView
@@ -181,7 +184,7 @@ class PlayerActivity : Activity() {
             if (arr != null) for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
                 val u = o.optString("u")
-                if (u.isNotEmpty()) lista.add(Item(u, o.optString("n", ""), o.optBoolean("live", false)))
+                if (u.isNotEmpty()) lista.add(Item(u, o.optString("n", ""), o.optBoolean("live", false), o.optString("l", "")))
             }
             items = lista
             indice = j.optInt("index", 0).coerceIn(0, maxOf(0, lista.size - 1))
@@ -252,7 +255,15 @@ class PlayerActivity : Activity() {
             setPadding(dp(14), dp(12), dp(18), 0)
         }
         arriba.addView(boton(R.drawable.ic_rep_volver, "Volver", 46, 0x00000000) { finish() })
-        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(4), 0, 0, 0) }
+        iLogo = ImageView(this).apply {
+            adjustViewBounds = true
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            background = GradientDrawable().apply { cornerRadius = dp(8).toFloat(); setColor(0x26FFFFFF) }
+            setPadding(dp(4), dp(3), dp(4), dp(3))
+            visibility = View.GONE
+        }
+        arriba.addView(iLogo, LinearLayout.LayoutParams(-2, dp(42)).apply { leftMargin = dp(2); rightMargin = dp(10) })
+        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(2), 0, 0, 0) }
         tTitulo = texto(17f, true).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
         info.addView(tTitulo)
         val sub = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(4), 0, 0) }
@@ -358,6 +369,7 @@ class PlayerActivity : Activity() {
     private fun acomodarControles() {
         val vivo = itemActual.vivo
         tTitulo.text = itemActual.nombre
+        ponerLogo(itemActual.logo)
         tTipo.text = if (vivo) "EN VIVO" else "PELÍCULA / SERIE"
         tTipo.background = pastilla(if (vivo) 0xFFE53935.toInt() else 0x33FFFFFF)
         bAtras10.visibility = if (vivo) View.GONE else View.VISIBLE
@@ -371,6 +383,33 @@ class PlayerActivity : Activity() {
         bSiguiente.isEnabled = indice < items.size - 1; bSiguiente.alpha = if (indice < items.size - 1) 1f else 0.35f
         tMotor.text = if (vlc != null) (if (porSoftware) "VLC · SW" else "VLC") else "EXO"
         tCalidad.visibility = View.GONE
+    }
+
+    /** Logo del canal al lado del nombre. Se baja una sola vez y se guarda. */
+    private fun ponerLogo(url: String) {
+        if (!url.startsWith("http")) { iLogo.visibility = View.GONE; return }
+        if (logos.containsKey(url)) {
+            val b = logos[url]
+            if (b != null) { iLogo.setImageBitmap(b); iLogo.visibility = View.VISIBLE } else iLogo.visibility = View.GONE
+            return
+        }
+        iLogo.visibility = View.GONE
+        val pedido = url
+        Thread {
+            val bmp = try {
+                val c = java.net.URL(pedido).openConnection() as java.net.HttpURLConnection
+                c.connectTimeout = 8000; c.readTimeout = 8000
+                c.instanceFollowRedirects = true
+                c.setRequestProperty("User-Agent", userAgent)
+                c.inputStream.use { android.graphics.BitmapFactory.decodeStream(it) }
+            } catch (e: Throwable) { null }
+            runOnUiThread {
+                logos[pedido] = bmp
+                if (!isFinishing && items.isNotEmpty() && itemActual.logo == pedido && bmp != null) {
+                    iLogo.setImageBitmap(bmp); iLogo.visibility = View.VISIBLE
+                }
+            }
+        }.start()
     }
 
     private val ocultarControlesR = Runnable { ocultarControles() }
