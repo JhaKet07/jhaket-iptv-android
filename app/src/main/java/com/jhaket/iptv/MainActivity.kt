@@ -44,6 +44,7 @@ class MainActivity : Activity() {
     /** Pedido de archivo en curso (botones "Elegir archivo" de la página). */
     private var subida: ValueCallback<Array<Uri>>? = null
     private val pedidoArchivo = 4207
+    private val pedidoReproductor = 4300
 
     /** true mientras se está reproduciendo un contenido: ahí sí se ocultan las barras. */
     @Volatile private var reproduciendo = false
@@ -303,6 +304,17 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun nativo(): Boolean = true
 
+        /** Abre el reproductor nativo (ExoPlayer + VLC). datos: {items:[{u,n,live}], index, start, ua} */
+        @JavascriptInterface
+        fun playNative(datos: String?) {
+            runOnUiThread {
+                try {
+                    @Suppress("DEPRECATION")
+                    startActivityForResult(Intent(this@MainActivity, PlayerActivity::class.java).putExtra("datos", datos ?: "{}"), pedidoReproductor)
+                } catch (e: Exception) { }
+            }
+        }
+
         /** Número de versión instalada. Coincide con el número de la versión publicada en
             GitHub (v10, v11…): así la página sabe si hay una más nueva para descargar. */
         @JavascriptInterface
@@ -371,6 +383,21 @@ class MainActivity : Activity() {
     /** Vuelve del selector de archivos: se le pasa a la página lo que se eligió (o nada). */
     @Deprecated("Se mantiene por compatibilidad con Android viejo")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        // Vuelve del reproductor nativo: la página guarda dónde quedó (Continuar viendo).
+        if (requestCode == pedidoReproductor) {
+            if (data != null) {
+                val url = data.getStringExtra("url")
+                if (url != null) {
+                    val pos = data.getDoubleExtra("pos", 0.0)
+                    val dur = data.getDoubleExtra("dur", 0.0)
+                    web.evaluateJavascript(
+                        "window.jhaketNativoFin && window.jhaketNativoFin(" + org.json.JSONObject.quote(url) + "," + pos + "," + dur + ")", null
+                    )
+                }
+            }
+            hideSystemBars()
+            return
+        }
         if (requestCode != pedidoArchivo) {
             @Suppress("DEPRECATION")
             super.onActivityResult(requestCode, resultCode, data)

@@ -41,5 +41,12 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Reproductor nativo (ExoPlayer + VLC), siempre acostado y a pantalla completa -->
+        <activity
+            android:name=".PlayerActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|keyboard|navigation"
+            android:theme="@style/Theme.JhaKet" />
     </application>
 </manifest>

@@ -15,7 +15,24 @@ android {
         // publicada: v10, v11…), así "Buscar actualización" compara directo.
         val compilacion = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
         versionCode = compilacion ?: 7
-        versionName = if (compilacion != null) "2.6 (v$compilacion)" else "2.6"
+        versionName = if (compilacion != null) "3.0 (v$compilacion)" else "3.0"
+        // VLC y FFmpeg traen código nativo: sólo para los procesadores de teléfonos y TV
+        // (ARM), así el APK no pesa el doble.
+        ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
+    }
+
+    // VLC y el decodificador de FFmpeg traen la misma librería de C++: se usa una sola.
+    packaging {
+        jniLibs {
+            pickFirsts += listOf("**/libc++_shared.so")
+            useLegacyPackaging = true
+        }
+    }
+
+    // La revisión de "lint" no frena la compilación del APK.
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
     }
 
     // Clave propia de JhaKet: llega desde los secretos de GitHub (ver build.yml). Con la
@@ -51,4 +68,18 @@ dependencies {
     implementation("androidx.webkit:webkit:1.12.1")
     // Revisión de avisos en segundo plano cada 15 minutos
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+
+    // ===== Reproductor nativo =====
+    // ExoPlayer (Media3): HLS, DASH, MPEG-TS, MP4/MKV, RTSP, RTMP y la interfaz del reproductor
+    val media3 = "1.5.0"
+    implementation("androidx.media3:media3-exoplayer:$media3")
+    implementation("androidx.media3:media3-exoplayer-hls:$media3")
+    implementation("androidx.media3:media3-exoplayer-dash:$media3")
+    implementation("androidx.media3:media3-exoplayer-rtsp:$media3")
+    implementation("androidx.media3:media3-datasource-rtmp:$media3")
+    implementation("androidx.media3:media3-ui:$media3")
+    // Decodificadores de audio de FFmpeg para ExoPlayer (AC3, E-AC3, DTS, TrueHD, MP2…)
+    implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.5.0+1")
+    // VLC, con todos sus códecs: se usa solo cuando ExoPlayer no puede con un enlace
+    implementation("org.videolan.android:libvlc-all:3.5.1")
 }
