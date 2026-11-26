@@ -21,6 +21,8 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.annotation.OptIn
 import androidx.media3.common.C
+import androidx.media3.common.ParserException
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.MimeTypes
@@ -74,7 +76,14 @@ class PlayerActivity : Activity() {
     private var items = listOf<Item>()
     private var indice = 0
     private var inicioMs = 0L
-    private var userAgent = "VLC/3.0.20 LibVLC/3.0.20"
+    /* Se presenta como el navegador del teléfono, igual que el reproductor de la página
+       (que es lo que ya funcionaba con estas listas). Si el canal lo rechaza, se prueba
+       como VLC. */
+    private var userAgent = ""
+    private val uaVlc = "VLC/3.0.20 LibVLC/3.0.20"
+    private var probeUa = false
+    /** El canal llegó a reproducir: recién ahí el vigía lo reinicia si se traba. */
+    private var yaReprodujo = false
 
     // ExoPlayer
     private var exo: ExoPlayer? = null
@@ -97,6 +106,11 @@ class PlayerActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 
+        userAgent = try {
+            android.webkit.WebSettings.getDefaultUserAgent(this)
+        } catch (e: Throwable) {
+            "Mozilla/5.0 (Linux; Android ${Build.VERSION.RELEASE}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+        }
         leerDatos()
         if (items.isEmpty()) { finish(); return }
 
@@ -148,6 +162,9 @@ class PlayerActivity : Activity() {
         liberarTodo()
         reintentos = 0
         probeHls = false
+        probeUa = false
+        yaReprodujo = false
+        cargandoDesde = 0L
         val esquema = Uri.parse(itemActual.url).scheme?.lowercase() ?: ""
         titulo.text = itemActual.nombre
         if (esquema in setOf("udp", "rtp", "mms", "mmsh", "srt", "rtmps")) arrancarVlc()
@@ -158,9 +175,15 @@ class PlayerActivity : Activity() {
 
     /** Reintentos con espera creciente: en vivo se insiste más antes de dar error. */
     private inner class Reintentos : DefaultLoadErrorHandlingPolicy() {
-        override fun getMinimumLoadableRetryCount(dataType: Int): Int = if (itemActual.vivo) 8 else 5
-        override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long =
-            (loadErrorInfo.errorCount * 1000L).coerceAtMost(5000L)
+        override fun getMinimumLoadableRetryCount(dataType: Int): Int = if (itemActual.vivo) 6 else 4
+        override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+            val e = loadErrorInfo.exception
+            // El servidor rechazó el pedido (403, 404…) o lo que mandó no se entiende:
+            // insistir no sirve, se pasa enseguida a la otra estrategia.
+            if (e is HttpDataSource.InvalidResponseCodeException && e.responseCode in 400..499) return C.TIME_UNSET
+            if (e is ParserException) return C.TIME_UNSET
+            return (loadErrorInfo.errorCount * 1000L).coerceAtMost(4000L)
+        }
     }
 
     private fun tipoPorUrl(url: String, forzarHls: Boolean): String? {
@@ -175,6 +198,7 @@ class PlayerActivity : Activity() {
     }
 
     private fun arrancarExo(forzarHls: Boolean?) {
+        cargandoDesde = 0L
         val http = DefaultHttpDataSource.Factory()
             .setUserAgent(userAgent)
             .setAllowCrossProtocolRedirects(true)
@@ -233,8 +257,9 @@ class PlayerActivity : Activity() {
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) = errorExo(error)
             override fun onPlaybackStateChanged(s: Int) {
-                cargandoDesde = if (s == Player.STATE_BUFFERING) System.currentTimeMillis() else 0L
-                if (s == Player.STATE_READY) { reintentos = 0; ocultarEstado() }
+                if (s == Player.STATE_BUFFERING) { if (cargandoDesde == 0L) cargandoDesde = System.currentTimeMillis() }
+                else cargandoDesde = 0L
+                if (s == Player.STATE_READY) { reintentos = 0; yaReprodujo = true; ocultarEstado() }
                 if (s == Player.STATE_ENDED && !itemActual.vivo && indice < items.size - 1) {
                     /* fin del episodio: el siguiente lo pasa la playlist sola */
                 }
@@ -242,7 +267,8 @@ class PlayerActivity : Activity() {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 val i = p.currentMediaItemIndex
                 if (i in items.indices && i != indice) {
-                    indice = i; inicioMs = 0; reintentos = 0; probeHls = false
+                    indice = i; inicioMs = 0; reintentos = 0; probeHls = false; probeUa = false; yaReprodujo = false
+                    cargandoDesde = System.currentTimeMillis()
                     titulo.text = itemActual.nombre
                     mostrarEstado(itemActual.nombre, 2500)
                 }
@@ -272,8 +298,20 @@ class PlayerActivity : Activity() {
             arrancarExo(true)
             return
         }
+        // El servidor rechazó el pedido (403…): se prueba presentándose como VLC.
+        val rechazado = error is PlaybackException && error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS
+        if (rechazado && !probeUa && userAgent != uaVlc) {
+            probeUa = true
+            userAgent = uaVlc
+            mostrarEstado("Probando otra conexión…", 0)
+            val pos = p.currentPosition
+            liberarExo()
+            inicioMs = if (itemActual.vivo) 0 else pos
+            arrancarExo(probeHls)
+            return
+        }
         // Cortes de red en vivo: se reintenta un par de veces antes de cambiar de motor.
-        val deRed = error is PlaybackException && error.errorCode in 2000..2999
+        val deRed = error is PlaybackException && error.errorCode in 2000..2999 && !rechazado
         if (deRed && itemActual.vivo && reintentos < 3) {
             reintentos++
             mostrarEstado("Reconectando… ($reintentos)", 0)
@@ -287,14 +325,29 @@ class PlayerActivity : Activity() {
         arrancarVlc()
     }
 
-    /** Vigía: si una señal en vivo queda cargando más de 12 s, se reinicia desde el vivo. */
+    /**
+     * Vigía:
+     *  - Si un canal que YA estaba reproduciendo se traba cargando más de 12 s, se lo
+     *    reinicia desde el vivo (corte momentáneo de la señal).
+     *  - Si un enlace nunca llega a arrancar en 20 s, no se insiste más con ExoPlayer:
+     *    se pasa a VLC (antes se reiniciaba para siempre y nunca cambiaba de motor).
+     */
     private val vigia = object : Runnable {
         override fun run() {
             val p = exo
-            if (p != null && itemActual.vivo && cargandoDesde > 0 && System.currentTimeMillis() - cargandoDesde > 12_000) {
-                cargandoDesde = System.currentTimeMillis()
-                mostrarEstado("Recuperando la señal…", 2500)
-                p.seekToDefaultPosition(); p.prepare()
+            val cargando = if (cargandoDesde > 0) System.currentTimeMillis() - cargandoDesde else 0L
+            if (p != null && cargando > 0) {
+                if (yaReprodujo && itemActual.vivo && cargando > 12_000) {
+                    cargandoDesde = System.currentTimeMillis()
+                    mostrarEstado("Recuperando la señal…", 2500)
+                    p.seekToDefaultPosition(); p.prepare()
+                } else if (!yaReprodujo && cargando > 20_000) {
+                    cargandoDesde = 0L
+                    mostrarEstado("No arranca con este motor: cambiando a VLC…", 0)
+                    inicioMs = if (itemActual.vivo) 0 else p.currentPosition
+                    liberarExo()
+                    arrancarVlc()
+                }
             }
             handler.postDelayed(this, 2000)
         }
