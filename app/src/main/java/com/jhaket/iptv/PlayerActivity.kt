@@ -79,7 +79,8 @@ import org.videolan.libvlc.util.VLCVideoLayout
 class PlayerActivity : Activity() {
 
     private data class Prog(val titulo: String, val inicio: Long, val fin: Long)
-    private data class Item(val url: String, val nombre: String, val vivo: Boolean, val logo: String = "", val guia: List<Prog> = emptyList())
+    private data class Item(val url: String, val nombre: String, val vivo: Boolean, val logo: String = "", val guia: List<Prog> = emptyList(),
+                            val guiaId: String = "", val guiaNombre: String = "", val guiaPais: String = "")
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var raiz: FrameLayout
@@ -126,6 +127,8 @@ class PlayerActivity : Activity() {
     private val uaVlc = "VLC/3.0.20 LibVLC/3.0.20"
 
     private var esTv = false
+    private var esAdmin = false
+    private lateinit var bVerificar: ImageButton
     private var bloqueado = false
     private var toqueEnCandado = false
     private var modoAspecto = 0
@@ -194,12 +197,14 @@ class PlayerActivity : Activity() {
                         val pr = g.optJSONObject(k) ?: continue
                         progs.add(Prog(pr.optString("t", ""), pr.optLong("s", 0L), pr.optLong("e", 0L)))
                     }
-                    lista.add(Item(u, o.optString("n", ""), o.optBoolean("live", false), o.optString("l", ""), progs))
+                    lista.add(Item(u, o.optString("n", ""), o.optBoolean("live", false), o.optString("l", ""), progs,
+                        o.optString("gid", ""), o.optString("gn", ""), o.optString("gp", "")))
                 }
             }
             items = lista
             indice = j.optInt("index", 0).coerceIn(0, maxOf(0, lista.size - 1))
             inicioMs = (j.optDouble("start", 0.0) * 1000).toLong()
+            esAdmin = j.optBoolean("admin", false)
             val ua = j.optString("ua", "")
             if (ua.isNotBlank()) userAgent = ua
         } catch (e: Exception) {
@@ -343,6 +348,8 @@ class PlayerActivity : Activity() {
         }
         fila.addView(bVivo)
         fila.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        bVerificar = boton(R.drawable.ic_rep_verificar, "Verificar la guía con Google", 44) { verificarGuia() }
+        fila.addView(bVerificar)
         bPistas = boton(R.drawable.ic_rep_pistas, "Audio y subtítulos", 44) { elegirPistas() }
         bAspecto = boton(R.drawable.ic_rep_aspecto, "Formato de imagen", 44) { cambiarAspecto() }
         bBloquear = boton(R.drawable.ic_candado_abierto, "Bloquear la pantalla", 44) { alternarBloqueo() }
@@ -399,6 +406,7 @@ class PlayerActivity : Activity() {
         bSiguiente.isEnabled = indice < items.size - 1; bSiguiente.alpha = if (indice < items.size - 1) 1f else 0.35f
         tMotor.text = if (vlc != null) (if (porSoftware) "VLC · SW" else "VLC") else "EXO"
         tCalidad.visibility = View.GONE
+        bVerificar.visibility = if (esAdmin && vivo && itemActual.guia.isNotEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun hora(ms: Long): String {
@@ -421,13 +429,85 @@ class PlayerActivity : Activity() {
         if (clave == guiaMostrada) return
         guiaMostrada = clave
         if (actual != null) {
-            tAhora.text = actual.titulo + "   " + hora(actual.inicio) + " – " + hora(actual.fin)
+            val bandera = if (esAdmin) banderaPais(itemActual.guiaPais) else ""
+            tAhora.text = (if (bandera.isNotEmpty()) "$bandera  " else "") + actual.titulo + "   " + hora(actual.inicio) + " – " + hora(actual.fin)
             tAhora.visibility = View.VISIBLE
         } else tAhora.visibility = View.GONE
         if (sigue != null) {
             tDespues.text = "Después: " + sigue.titulo + " · " + hora(sigue.inicio)
             tDespues.visibility = View.VISIBLE
         } else tDespues.visibility = View.GONE
+    }
+
+    private fun banderaPais(c: String): String {
+        if (c == "latam") return "🌎"
+        if (c.length != 2) return ""
+        val k = if (c == "uk") "GB" else c.uppercase()
+        return k.map { String(Character.toChars(0x1F1E6 + (it - 'A'))) }.joinToString("")
+    }
+
+    /** Pregunta a Google (por el servidor de JhaKet) si la guía coincide con lo que se emite. */
+    private fun verificarGuia() {
+        val ahora = System.currentTimeMillis()
+        val it0 = itemActual
+        val actual = it0.guia.firstOrNull { it.inicio <= ahora && it.fin > ahora } ?: run {
+            mostrarIndicador("La guía no tiene un programa\npara este momento", 1800); return
+        }
+        val token = getSharedPreferences("jhaket", MODE_PRIVATE).getString("token", "") ?: ""
+        if (token.isEmpty()) { mostrarIndicador("Iniciá sesión de nuevo\npara verificar", 1800); return }
+        mostrarIndicador("Consultando a Google…", 0)
+        handler.removeCallbacks(ocultarControlesR)
+        Thread {
+            var titulo: String; var cuerpo: String
+            try {
+                val c = java.net.URL("https://jhaketiptv.floot.app/_api/ext/action?t=" + java.net.URLEncoder.encode(token, "UTF-8"))
+                    .openConnection() as java.net.HttpURLConnection
+                c.requestMethod = "POST"; c.doOutput = true
+                c.connectTimeout = 15000; c.readTimeout = 60000
+                c.setRequestProperty("Content-Type", "text/plain;charset=UTF-8")
+                val datos = JSONObject()
+                    .put("action", "epg.verify").put("channel", it0.nombre)
+                    .put("epgId", it0.guiaId).put("epgName", it0.guiaNombre)
+                    .put("title", actual.titulo).put("start", actual.inicio).put("stop", actual.fin)
+                c.outputStream.use { it.write(datos.toString().toByteArray()) }
+                val txt = (if (c.responseCode in 200..299) c.inputStream else c.errorStream).bufferedReader().use { it.readText() }
+                val r = JSONObject(txt)
+                if (r.has("error")) { titulo = "No se pudo verificar"; cuerpo = r.optString("error") }
+                else {
+                    val programa = r.optString("programa", "")
+                    val explicacion = r.optString("explicacion", "")
+                    val paisGuia = r.optString("paisGuia", "")
+                    val fuentes = r.optJSONArray("fuentes")?.length() ?: 0
+                    titulo = when {
+                        r.isNull("coincide") -> "❔ No se pudo confirmar"
+                        r.optBoolean("coincide") -> "✅ La guía coincide"
+                        else -> "⚠️ La guía no coincide"
+                    }
+                    val sb = StringBuilder()
+                    sb.append("Canal: ").append(it0.nombre).append("\n")
+                    sb.append("Guía: ").append(actual.titulo).append(" (").append(hora(actual.inicio)).append(" – ").append(hora(actual.fin)).append(")\n")
+                    if (it0.guiaNombre.isNotEmpty()) sb.append("Canal de la guía: ").append(it0.guiaNombre).append(if (it0.guiaPais.isNotEmpty()) "  " + banderaPais(it0.guiaPais) else "").append("\n")
+                    if (programa.isNotEmpty()) sb.append("\nSegún Google, ahora en Argentina: ").append(programa).append("\n")
+                    if (paisGuia.isNotEmpty()) sb.append("La guía parece ser de la señal de: ").append(paisGuia).append("\n")
+                    if (explicacion.isNotEmpty()) sb.append("\n").append(explicacion).append("\n")
+                    if (r.optBoolean("coincide", true) == false && !r.isNull("coincide"))
+                        sb.append("\nPara corregirlo: en Agregar contenido → Editar, elegí otro canal de la guía (el de la señal de Argentina).")
+                    sb.append("\n\nFuentes consultadas: ").append(fuentes)
+                    cuerpo = sb.toString()
+                }
+            } catch (e: Throwable) {
+                titulo = "No se pudo verificar"; cuerpo = "Revisá la conexión y probá de nuevo."
+            }
+            runOnUiThread {
+                if (isFinishing) return@runOnUiThread
+                indicador.visibility = View.GONE
+                AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle(titulo).setMessage(cuerpo)
+                    .setPositiveButton("Listo", null)
+                    .setOnDismissListener { pantallaCompleta(); mostrarControles() }
+                    .show()
+            }
+        }.start()
     }
 
     /** Logo del canal al lado del nombre. Se baja una sola vez y se guarda. */
