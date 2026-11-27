@@ -1351,7 +1351,7 @@ class PlayerActivity : Activity() {
      * viejas se cierran cuando creen que el video terminó), se le vuelve a mandar; si no
      * responde más (se apagó), se sigue viendo en el celular.
      */
-    private val vigiaTele = object : Runnable {
+    private val vigiaTele: Runnable = object : Runnable {
         override fun run() {
             val t = teleDlna ?: return
             Thread {
