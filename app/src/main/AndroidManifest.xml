@@ -10,6 +10,9 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- Tocar el control de la barra con la ventana flotante: se vuelve a agrandar -->
     <uses-permission android:name="android.permission.REORDER_TASKS" />
+    <!-- Mientras el celular le pasa el video a la tele: que Android no congele la app -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <!-- Para que la app aparezca también en Android TV y Google TV -->
@@ -62,5 +65,9 @@
             android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|keyboard|navigation"
             android:theme="@style/Theme.JhaKet" />
+        <service
+            android:name=".ServicioPuente"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
     </application>
 </manifest>

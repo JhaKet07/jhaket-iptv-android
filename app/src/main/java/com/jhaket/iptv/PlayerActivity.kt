@@ -1334,6 +1334,8 @@ class PlayerActivity : Activity() {
         val ruta = (Uri.parse(it0.url).path ?: it0.url).lowercase()
         val porPuente = it0.vivo || ruta.endsWith(".m3u8") || ruta.endsWith(".m3u") || it0.url.startsWith("https", true)
         val puente = if (porPuente) Rele.publicar(this, it0.url, userAgent) else null
+        // Con el puente andando, Android no puede congelar la app al salir o bloquear el teléfono.
+        if (puente != null) ServicioPuente.iniciar(this, t.nombre, it0.nombre)
         teleReproduce = false; envioDesde = System.currentTimeMillis(); sinRespuesta = 0
         handler.removeCallbacks(vigiaTele)
         Thread {
@@ -1430,6 +1432,7 @@ class PlayerActivity : Activity() {
         teleDlna?.let { t -> Thread { Dlna.detener(t) }.start() }
         handler.removeCallbacks(vigiaTele)
         Rele.detener()
+        ServicioPuente.detener(this)
         teleDlna = null; destinoNombre = null; ultimoEnviado = ""; remotaPausada = false
         mostrarEstadoTele()
         if (verAca) reanudarLocal(if (pos > 0) pos else -1L)
@@ -1605,7 +1608,7 @@ class PlayerActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         control?.liberar(); control = null
-        if (teleDlna != null) Rele.detener()
+        if (teleDlna != null) { Rele.detener(); ServicioPuente.detener(this) }
         if (abierto?.get() === this) abierto = null
         try { Cast.iniciar(this)?.sessionManager?.removeSessionManagerListener(oyenteCast, CastSession::class.java) } catch (e: Throwable) { }
         liberarTodo()
