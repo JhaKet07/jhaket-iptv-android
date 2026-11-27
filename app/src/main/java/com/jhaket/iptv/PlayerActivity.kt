@@ -1211,13 +1211,24 @@ class PlayerActivity : Activity() {
             .show()
     }
 
+    /** Mientras se ve en la tele, el celular deja de bajar el canal en vivo: muchos servidores
+        de IPTV permiten una sola conexión por cuenta y cortarían la de la tele. */
+    private var localDetenido = false
+
     private fun pausarLocal() {
-        exo?.pause(); vlc?.pause()
+        if (itemActual.vivo) {
+            exo?.stop(); vlc?.stop(); localDetenido = true
+        } else {
+            exo?.pause(); vlc?.pause()
+        }
         cargandoDesde = 0L
     }
 
     private fun reanudarLocal(posMs: Long) {
+        val estabaDetenido = localDetenido
+        localDetenido = false
         exo?.let {
+            if (estabaDetenido) it.prepare()
             if (itemActual.vivo) it.seekToDefaultPosition() else if (posMs >= 0) it.seekTo(posMs)
             it.play(); return
         }
@@ -1301,7 +1312,13 @@ class PlayerActivity : Activity() {
 
     // ---- DLNA ----
 
+    private var reenviosTele = 0
+    private var teleReproduce = false
+    private var envioDesde = 0L
+    private var sinRespuesta = 0
+
     private fun enviarDlna(t: Dlna.Tele) {
+        reenviosTele = 0
         destinoNombre = t.nombre; teleDlna = t; enCast = false; remotaPausada = false
         ponerEstadoTele("Conectando con ${t.nombre}…")
         pausarLocal()
@@ -1312,14 +1329,69 @@ class PlayerActivity : Activity() {
         val t = teleDlna ?: return
         val it0 = itemActual
         ultimoEnviado = it0.url
+        // En vivo, listas .m3u8 o https: pasa por el puente del celular (video continuo que
+        // entienden todas las teles). Películas .mp4/.mkv por http: directo, así se pueden adelantar.
+        val ruta = (Uri.parse(it0.url).path ?: it0.url).lowercase()
+        val porPuente = it0.vivo || ruta.endsWith(".m3u8") || ruta.endsWith(".m3u") || it0.url.startsWith("https", true)
+        val puente = if (porPuente) Rele.publicar(this, it0.url, userAgent) else null
+        teleReproduce = false; envioDesde = System.currentTimeMillis(); sinRespuesta = 0
+        handler.removeCallbacks(vigiaTele)
         Thread {
-            val ok = Dlna.reproducir(t, it0.url, it0.nombre, it0.vivo)
+            val ok = Dlna.reproducir(t, puente ?: it0.url, it0.nombre, it0.vivo, puente != null)
             runOnUiThread {
                 if (teleDlna !== t) return@runOnUiThread
-                if (ok) ponerEstadoTele("Viendo en ${t.nombre}")
+                if (ok) { ponerEstadoTele("Viendo en ${t.nombre}"); handler.postDelayed(vigiaTele, 5000) }
                 else { mostrarAviso("${t.nombre} no aceptó el enlace. Probá con «Duplicar la pantalla».", 6000); detenerEnvio(true) }
             }
         }.start()
+    }
+
+    /**
+     * Cada 4 segundos se le pregunta a la tele cómo va. Si dejó de reproducir sola (las teles
+     * viejas se cierran cuando creen que el video terminó), se le vuelve a mandar; si no
+     * responde más (se apagó), se sigue viendo en el celular.
+     */
+    private val vigiaTele = object : Runnable {
+        override fun run() {
+            val t = teleDlna ?: return
+            Thread {
+                val e = Dlna.estado(t)
+                runOnUiThread {
+                    if (teleDlna !== t) return@runOnUiThread
+                    val ahora = System.currentTimeMillis()
+                    if (e == null) {
+                        if (++sinRespuesta >= 5) { mostrarAviso("${t.nombre} dejó de responder", 5000); detenerEnvio(true); return@runOnUiThread }
+                    } else {
+                        sinRespuesta = 0
+                        when (e) {
+                            "PLAYING" -> {
+                                if (!teleReproduce) ponerEstadoTele("Viendo en ${t.nombre}")
+                                teleReproduce = true
+                                if (remotaPausada) remotaPausada = false
+                                // Varios minutos andando bien: se renuevan los reintentos.
+                                if (ahora - envioDesde > 3 * 60_000) reenviosTele = 0
+                            }
+                            "PAUSED_PLAYBACK" -> remotaPausada = true
+                            "STOPPED", "NO_MEDIA_PRESENT" -> {
+                                if (!remotaPausada && (teleReproduce || ahora - envioDesde > 30_000)) {
+                                    if (reenviosTele < 3) {
+                                        reenviosTele++
+                                        mostrarAviso("La tele cortó: reconectando…", 3000)
+                                        ponerEstadoTele("Reconectando con ${t.nombre}…")
+                                        enviarDlnaActual()
+                                        return@runOnUiThread
+                                    }
+                                    mostrarAviso("${t.nombre} dejó de reproducir", 5000)
+                                    detenerEnvio(true)
+                                    return@runOnUiThread
+                                }
+                            }
+                        }
+                    }
+                    handler.postDelayed(vigiaTele, 4000)
+                }
+            }.start()
+        }
     }
 
     // ---- Comunes ----
@@ -1356,6 +1428,8 @@ class PlayerActivity : Activity() {
             try { sm?.endCurrentSession(true) } catch (e: Throwable) { }
         }
         teleDlna?.let { t -> Thread { Dlna.detener(t) }.start() }
+        handler.removeCallbacks(vigiaTele)
+        Rele.detener()
         teleDlna = null; destinoNombre = null; ultimoEnviado = ""; remotaPausada = false
         mostrarEstadoTele()
         if (verAca) reanudarLocal(if (pos > 0) pos else -1L)
@@ -1531,6 +1605,7 @@ class PlayerActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         control?.liberar(); control = null
+        if (teleDlna != null) Rele.detener()
         if (abierto?.get() === this) abierto = null
         try { Cast.iniciar(this)?.sessionManager?.removeSessionManagerListener(oyenteCast, CastSession::class.java) } catch (e: Throwable) { }
         liberarTodo()
