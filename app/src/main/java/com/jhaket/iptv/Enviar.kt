@@ -379,6 +379,7 @@ object Rele {
         var ua = uaPrimero
         var fallas = 0
         val buf = ByteArray(64 * 1024)
+        val avance = Avance()
         while (sigue()) {
             try {
                 val (c, u) = abrir(url, ua)
@@ -390,7 +391,7 @@ object Rele {
                     if (inicio.startsWith("#EXTM3U")) {
                         val texto = String(buf, 0, n, Charsets.UTF_8) + String(ins.readBytes(), Charsets.UTF_8)
                         c.disconnect()
-                        if (hls(texto, url, u, ua, out, sigue)) return   // película o serie: terminó
+                        if (hls(texto, url, u, ua, out, sigue, avance)) return   // película o serie: terminó
                         fallas++
                     } else {
                         escribir(out, buf, 0, n)
@@ -431,8 +432,27 @@ object Rele {
         return b
     }
 
-    /** Devuelve true si era una película o serie y se mandó completa. */
-    private fun hls(texto0: String, fuente0: String, base0: URL, ua: String, out: java.io.OutputStream, sigue: () -> Boolean): Boolean {
+    /** Por dónde va la transmisión: si hay que reconectar, se sigue desde la parte siguiente. */
+    private class Avance { var ultimo = -1L }
+
+    private fun leerConReintentos(url: String, ua: String): ByteArray {
+        var error: Throwable? = null
+        for (intento in 0 until 3) {
+            try { return leer(url, ua).first } catch (e: Throwable) { error = e }
+            try { Thread.sleep(400L * (intento + 1)) } catch (x: InterruptedException) { break }
+        }
+        throw error ?: java.io.IOException("no se pudo bajar")
+    }
+
+    /**
+     * Canal HLS: un hilo baja las partes nuevas lo más rápido posible y las deja en una reserva;
+     * otro se las entrega a la tele al ritmo que ella las pide. Así una descarga nunca queda
+     * colgada esperando a la tele (los servidores cortan las descargas lentas y llegaban
+     * partes incompletas: imagen congelada y audio que seguía).
+     * Devuelve true si era una película o serie y se mandó completa.
+     */
+    private fun hls(texto0: String, fuente0: String, base0: URL, ua: String, out: java.io.OutputStream,
+                    sigue: () -> Boolean, avance: Avance): Boolean {
         var texto = texto0
         var fuente = fuente0
         var base = base0
@@ -452,71 +472,95 @@ object Rele {
             val (b, u) = leer(fuente, ua)
             texto = String(b, Charsets.UTF_8); base = u
         }
-        var ultimo = -1L
-        var fallas = 0
-        val claves = HashMap<String, ByteArray>()
-        while (sigue()) {
-            val primera = Regex("#EXT-X-MEDIA-SEQUENCE:(\\d+)").find(texto)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-            val objetivo = Regex("#EXT-X-TARGETDURATION:(\\d+)").find(texto)?.groupValues?.get(1)?.toLongOrNull() ?: 6L
-            val fin = texto.contains("#EXT-X-ENDLIST")
-            val partes = mutableListOf<Parte>()
-            var metodo = "NONE"; var clave: String? = null; var iv: String? = null; var n = primera
-            for (l0 in texto.lines()) {
-                val l = l0.trim()
-                if (l.startsWith("#EXT-X-KEY")) {
-                    metodo = Regex("METHOD=([A-Z0-9-]+)").find(l)?.groupValues?.get(1) ?: "NONE"
-                    clave = Regex("URI=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
-                    iv = Regex("IV=0[xX]([0-9a-fA-F]+)").find(l)?.groupValues?.get(1)
-                } else if (l.isNotEmpty() && !l.startsWith("#")) {
-                    partes.add(Parte(n, l, metodo, clave, iv)); n++
-                }
-            }
-            // En vivo se arranca cerca del momento actual (las últimas 3 partes).
-            if (ultimo < 0 && !fin) ultimo = primera + partes.size - 4
-            // El servidor reinició la numeración.
-            if (partes.isNotEmpty() && partes.last().seq < ultimo - 20) ultimo = partes.first().seq - 1
-            for (p in partes) {
-                if (!sigue()) return false
-                if (p.seq <= ultimo) continue
-                try {
-                    val u = URL(base, p.uri).toString()
-                    when {
-                        p.metodo == "AES-128" && p.clave != null -> {
-                            val k = claves.getOrPut(p.clave) { leer(URL(base, p.clave).toString(), ua).first }
-                            val datos = leer(u, ua).first
-                            val ci = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding")
-                            ci.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(k, "AES"), javax.crypto.spec.IvParameterSpec(ivDe(p.iv, p.seq)))
-                            escribir(out, ci.doFinal(datos))
-                        }
-                        p.metodo == "NONE" -> {
-                            val (c, _) = abrir(u, ua)
-                            try {
-                                val ins = c.inputStream
-                                val buf = ByteArray(64 * 1024)
-                                while (true) { val k = ins.read(buf); if (k < 0) break; escribir(out, buf, 0, k) }
-                            } finally { try { c.disconnect() } catch (e: Throwable) { } }
-                        }
-                        else -> { }   // cifrados que no se pueden abrir: se saltean
-                    }
-                    fallas = 0
-                } catch (e: TeleCerrada) {
-                    throw e
-                } catch (e: Throwable) {
-                    fallas++
-                }
-                ultimo = p.seq
-            }
-            if (fin) return true
-            try { Thread.sleep(maxOf(1000L, objetivo * 1000L / 2)) } catch (e: InterruptedException) { return false }
+
+        val cola = java.util.concurrent.ArrayBlockingQueue<ByteArray>(10)
+        val FIN = ByteArray(0)
+        val andando = java.util.concurrent.atomic.AtomicBoolean(true)
+        val completa = java.util.concurrent.atomic.AtomicBoolean(false)
+        val sigueTodo = { andando.get() && sigue() }
+        fun poner(b: ByteArray): Boolean {
+            while (sigueTodo()) { if (cola.offer(b, 1, java.util.concurrent.TimeUnit.SECONDS)) return true }
+            return false
+        }
+
+        val productor = Thread {
+            var tx = texto; var bs = base
+            var fallas = 0
+            val claves = HashMap<String, ByteArray>()
             try {
-                val (b, u) = leer(fuente, ua)
-                texto = String(b, Charsets.UTF_8); base = u
-            } catch (e: Throwable) {
-                fallas++
-                if (fallas > 10) return false
-                try { Thread.sleep(2000) } catch (x: InterruptedException) { return false }
+                while (sigueTodo()) {
+                    val primera = Regex("#EXT-X-MEDIA-SEQUENCE:(\\d+)").find(tx)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val objetivo = Regex("#EXT-X-TARGETDURATION:(\\d+)").find(tx)?.groupValues?.get(1)?.toLongOrNull() ?: 6L
+                    val fin = tx.contains("#EXT-X-ENDLIST")
+                    val partes = mutableListOf<Parte>()
+                    var metodo = "NONE"; var clave: String? = null; var iv: String? = null; var n = primera
+                    for (l0 in tx.lines()) {
+                        val l = l0.trim()
+                        if (l.startsWith("#EXT-X-KEY")) {
+                            metodo = Regex("METHOD=([A-Z0-9-]+)").find(l)?.groupValues?.get(1) ?: "NONE"
+                            clave = Regex("URI=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
+                            iv = Regex("IV=0[xX]([0-9a-fA-F]+)").find(l)?.groupValues?.get(1)
+                        } else if (l.isNotEmpty() && !l.startsWith("#")) {
+                            partes.add(Parte(n, l, metodo, clave, iv)); n++
+                        }
+                    }
+                    if (partes.isNotEmpty()) {
+                        // En vivo se arranca con las últimas 3 partes (colchón para la tele).
+                        if (avance.ultimo < 0 && !fin) avance.ultimo = partes.last().seq - 3
+                        // Se perdió el hilo (reconexión larga o el servidor reinició la numeración):
+                        // se sigue desde la parte más nueva, sin repetir lo ya visto.
+                        if (partes.last().seq < avance.ultimo - 20 || partes.first().seq > avance.ultimo + 1 + 30)
+                            avance.ultimo = partes.last().seq - 1
+                    }
+                    for (p in partes) {
+                        if (!sigueTodo()) return@Thread
+                        if (p.seq <= avance.ultimo) continue
+                        try {
+                            val u = URL(bs, p.uri).toString()
+                            val datos: ByteArray? = when {
+                                p.metodo == "AES-128" && p.clave != null -> {
+                                    val k = claves.getOrPut(p.clave) { leerConReintentos(URL(bs, p.clave).toString(), ua) }
+                                    val ci = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding")
+                                    ci.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(k, "AES"), javax.crypto.spec.IvParameterSpec(ivDe(p.iv, p.seq)))
+                                    ci.doFinal(leerConReintentos(u, ua))
+                                }
+                                p.metodo == "NONE" -> leerConReintentos(u, ua)
+                                else -> null   // cifrado que no se puede abrir
+                            }
+                            if (datos != null && !poner(datos)) return@Thread
+                            fallas = 0
+                        } catch (e: Throwable) {
+                            fallas++
+                        }
+                        avance.ultimo = p.seq
+                    }
+                    if (fin) { completa.set(true); return@Thread }
+                    try { Thread.sleep(maxOf(1000L, objetivo * 1000L / 3)) } catch (e: InterruptedException) { return@Thread }
+                    try {
+                        val (b, u) = leer(fuente, ua)
+                        tx = String(b, Charsets.UTF_8); bs = u
+                        fallas = 0
+                    } catch (e: Throwable) {
+                        if (++fallas > 15) return@Thread
+                        try { Thread.sleep(1500) } catch (x: InterruptedException) { return@Thread }
+                    }
+                }
+            } finally {
+                // Aviso de fin para el que le entrega a la tele.
+                try { cola.offer(FIN, 3, java.util.concurrent.TimeUnit.SECONDS) } catch (e: Throwable) { }
             }
         }
-        return false
+        productor.start()
+        try {
+            while (sigue()) {
+                val b = cola.poll(1, java.util.concurrent.TimeUnit.SECONDS) ?: continue
+                if (b === FIN) break
+                escribir(out, b)
+            }
+        } finally {
+            andando.set(false)
+            productor.interrupt()
+        }
+        return completa.get()
     }
 }
