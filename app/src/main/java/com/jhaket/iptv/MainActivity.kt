@@ -326,6 +326,14 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun nativo(): Boolean = true
 
+        /** "Salir" del cartel de confirmación: cierra la app de verdad (no queda abierta atrás). */
+        @JavascriptInterface
+        fun salir() {
+            runOnUiThread {
+                try { finishAndRemoveTask() } catch (e: Exception) { finish() }
+            }
+        }
+
         /** Si la app corre en un televisor (Android TV / Google TV). */
         @JavascriptInterface
         fun esTv(): Boolean = try {
@@ -372,9 +380,12 @@ class MainActivity : Activity() {
     override fun onBackPressed() {
         // Primero se sale de la pantalla completa de la página, si la hay.
         if (vistaCompleta != null) { salirDePantallaCompleta(); return }
+        // JhaKet decide qué cierra cada Atrás (ventana, reproductor, ficha…) y, con nada
+        // abierto, muestra "¿Querés salir de JhaKet?". Ya no se usa el historial de la
+        // página: quedaba lleno de pasos y Atrás nunca llegaba a salir.
         web.evaluateJavascript("(window.jhaketBack && window.jhaketBack()) ? 1 : 0") { r ->
             if (r?.trim() == "1") return@evaluateJavascript
-            if (web.canGoBack()) web.goBack() else finish()
+            try { finishAndRemoveTask() } catch (e: Exception) { finish() }
         }
     }
 
