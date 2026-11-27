@@ -82,4 +82,9 @@ dependencies {
     implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.5.0+1")
     // VLC, con todos sus códecs: se usa solo cuando ExoPlayer no puede con un enlace
     implementation("org.videolan.android:libvlc-all:3.5.1")
+
+    // ===== Enviar a la tele =====
+    // Google Cast: Chromecast, Android TV y Google TV
+    implementation("com.google.android.gms:play-services-cast-framework:21.5.0")
+    implementation("androidx.mediarouter:mediarouter:1.7.0")
 }

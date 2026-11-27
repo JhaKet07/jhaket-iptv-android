@@ -55,6 +55,12 @@ import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import androidx.mediarouter.media.MediaRouter
+import com.google.android.gms.cast.MediaInfo
+import com.google.android.gms.cast.MediaLoadRequestData
+import com.google.android.gms.cast.framework.CastSession
+import com.google.android.gms.cast.framework.SessionManagerListener
+import com.google.android.gms.common.images.WebImage
 import org.json.JSONObject
 import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
@@ -129,6 +135,15 @@ class PlayerActivity : Activity() {
     private var esTv = false
     private var esAdmin = false
     private lateinit var bVerificar: ImageButton
+
+    // Enviar a la tele (sólo en el celular)
+    private lateinit var bEnviar: ImageButton
+    private lateinit var barraTele: TextView
+    private var destinoNombre: String? = null      // tele a la que se está enviando
+    private var enCast = false
+    private var teleDlna: Dlna.Tele? = null
+    private var ultimoEnviado = ""
+    private var remotaPausada = false
     private var bloqueado = false
     private var toqueEnCandado = false
     private var modoAspecto = 0
@@ -173,6 +188,7 @@ class PlayerActivity : Activity() {
 
         leerDatos()
         if (items.isEmpty()) { finish(); return }
+        if (!esTv) Cast.iniciar(this)?.sessionManager?.addSessionManagerListener(oyenteCast, CastSession::class.java)
 
         armarPantalla()
         setContentView(raiz)
@@ -350,6 +366,9 @@ class PlayerActivity : Activity() {
         fila.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
         bVerificar = boton(R.drawable.ic_rep_verificar, "Verificar la guía con Google", 44) { verificarGuia() }
         fila.addView(bVerificar)
+        bEnviar = boton(R.drawable.ic_rep_enviar, "Enviar a la tele", 44) { elegirTele() }
+        if (esTv) bEnviar.visibility = View.GONE
+        fila.addView(bEnviar)
         bPistas = boton(R.drawable.ic_rep_pistas, "Audio y subtítulos", 44) { elegirPistas() }
         bAspecto = boton(R.drawable.ic_rep_aspecto, "Formato de imagen", 44) { cambiarAspecto() }
         bBloquear = boton(R.drawable.ic_candado_abierto, "Bloquear la pantalla", 44) { alternarBloqueo() }
@@ -385,6 +404,16 @@ class PlayerActivity : Activity() {
             setOnClickListener { alternarBloqueo() }
         }
         raiz.addView(candado, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER))
+
+        // "Viendo en la tele": arriba en el medio mientras se envía (con los controles escondidos)
+        barraTele = texto(14f, true).apply {
+            background = GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(0xE61E88E5.toInt()) }
+            setPadding(dp(18), dp(9), dp(18), dp(9)); setShadowLayer(0f, 0f, 0f, 0)
+            visibility = View.GONE
+            isClickable = true
+            setOnClickListener { elegirTele() }
+        }
+        raiz.addView(barraTele, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(16) })
     }
 
     /** Se acomodan los controles según lo que se reproduce (en vivo o película). */
@@ -407,6 +436,8 @@ class PlayerActivity : Activity() {
         tMotor.text = if (vlc != null) (if (porSoftware) "VLC · SW" else "VLC") else "EXO"
         tCalidad.visibility = View.GONE
         bVerificar.visibility = if (esAdmin && vivo && itemActual.guia.isNotEmpty()) View.VISIBLE else View.GONE
+        // Cambió el canal o el episodio mientras se envía a la tele: se manda el nuevo.
+        if (destinoNombre != null && itemActual.url != ultimoEnviado) handler.post { reenviar() }
     }
 
     private fun hora(ms: Long): String {
@@ -543,11 +574,13 @@ class PlayerActivity : Activity() {
         controles.visibility = View.VISIBLE
         handler.removeCallbacks(ocultarControlesR)
         if (!arrastrandoBarra) handler.postDelayed(ocultarControlesR, 4000)
+        mostrarEstadoTele()
     }
     private fun ocultarControles() {
         controles.visibility = View.GONE
         handler.removeCallbacks(ocultarControlesR)
         pantallaCompleta()
+        mostrarEstadoTele()
     }
     private fun alternarControles() { if (controles.visibility == View.VISIBLE) ocultarControles() else mostrarControles() }
 
@@ -555,7 +588,9 @@ class PlayerActivity : Activity() {
     private val actualizar = object : Runnable {
         override fun run() {
             val reproduciendo = exo?.isPlaying ?: (vlc?.isPlaying ?: false)
-            bPlay.setImageResource(if (reproduciendo || exo?.playWhenReady == true && vlc == null && exo?.playbackState == Player.STATE_BUFFERING) R.drawable.ic_rep_pausa else R.drawable.ic_rep_play)
+            val andando = if (destinoNombre != null) !remotaPausada
+                else reproduciendo || exo?.playWhenReady == true && vlc == null && exo?.playbackState == Player.STATE_BUFFERING
+            bPlay.setImageResource(if (andando) R.drawable.ic_rep_pausa else R.drawable.ic_rep_play)
             if (!itemActual.vivo && !arrastrandoBarra) {
                 val d = duracion(); val pos = posicion()
                 if (d > 0) {
@@ -615,6 +650,7 @@ class PlayerActivity : Activity() {
         mostrarIndicador(if (delta > 0) "+10 s" else "−10 s", 600)
     }
     private fun alternarPausa() {
+        if (destinoNombre != null) { pausaRemota(); return }
         exo?.let { if (it.isPlaying) it.pause() else it.play(); return }
         vlc?.let { if (it.isPlaying) it.pause() else it.play() }
     }
@@ -998,7 +1034,7 @@ class PlayerActivity : Activity() {
         override fun run() {
             val p = exo
             val espera = if (cargandoDesde > 0) System.currentTimeMillis() - cargandoDesde else 0L
-            if (p != null && espera > 0) {
+            if (p != null && espera > 0 && destinoNombre == null) {
                 if (yaReprodujo && itemActual.vivo && espera > 12_000) {
                     cargandoDesde = System.currentTimeMillis()
                     mostrarAviso("Recuperando la señal…", 2500)
@@ -1076,6 +1112,249 @@ class PlayerActivity : Activity() {
     }
 
     // ============================================================
+    // Enviar a la tele (Chromecast / Google TV, Smart TV por DLNA, duplicar pantalla)
+    // ============================================================
+
+    private val temaDialogo = android.R.style.Theme_DeviceDefault_Dialog_Alert
+
+    private fun elegirTele() {
+        handler.removeCallbacks(ocultarControlesR)
+        val nombre = destinoNombre
+        if (nombre != null) {
+            AlertDialog.Builder(this, temaDialogo)
+                .setTitle("Viendo en $nombre")
+                .setItems(arrayOf("Dejar de enviar y ver en el celular", "Enviar a otra tele")) { _, i ->
+                    if (i == 0) detenerEnvio(true) else { detenerEnvio(false); buscarTeles() }
+                }
+                .setOnDismissListener { pantallaCompleta(); mostrarControles() }
+                .show()
+            return
+        }
+        buscarTeles()
+    }
+
+    private fun buscarTeles() {
+        val cast = Cast.iniciar(this)
+        val router = if (cast != null) try { MediaRouter.getInstance(this) } catch (e: Throwable) { null } else null
+        val oyenteRutas = object : MediaRouter.Callback() {}
+        try { router?.addCallback(Cast.selector, oyenteRutas, MediaRouter.CALLBACK_FLAG_PERFORM_ACTIVE_SCAN) } catch (e: Throwable) { }
+        var cancelado = false
+        val espera = AlertDialog.Builder(this, temaDialogo)
+            .setTitle("Buscando teles en tu WiFi…")
+            .setView(ProgressBar(this).apply { isIndeterminate = true; setPadding(0, dp(20), 0, dp(20)) })
+            .setNegativeButton("Cancelar") { _, _ -> cancelado = true }
+            .setOnCancelListener { cancelado = true }
+            .create()
+        espera.setOnDismissListener { if (cancelado) { try { router?.removeCallback(oyenteRutas) } catch (e: Throwable) { }; pantallaCompleta() } }
+        espera.show()
+        Thread {
+            val dlna = Dlna.buscar(this, 3500)
+            runOnUiThread {
+                if (cancelado || isFinishing) return@runOnUiThread
+                espera.dismiss()
+                val rutas = try {
+                    router?.routes?.filter { !it.isDefault && it.isEnabled && it.matchesSelector(Cast.selector) } ?: emptyList()
+                } catch (e: Throwable) { emptyList() }
+                mostrarTeles(rutas, dlna, router, oyenteRutas)
+            }
+        }.start()
+    }
+
+    private fun mostrarTeles(rutas: List<MediaRouter.RouteInfo>, dlna: List<Dlna.Tele>, router: MediaRouter?, oyenteRutas: MediaRouter.Callback) {
+        val nombres = mutableListOf<String>()
+        val acciones = mutableListOf<() -> Unit>()
+        val vistos = HashSet<String>()
+        for (r in rutas) { vistos.add(r.name.lowercase()); nombres.add("📺  ${r.name}   ·  Chromecast / Google TV"); acciones.add { enviarCast(r) } }
+        // Las Android TV aparecen también por DLNA: si ya están por Cast, no se repiten.
+        for (t in dlna) if (vistos.add(t.nombre.lowercase())) { nombres.add("📺  ${t.nombre}   ·  Smart TV"); acciones.add { enviarDlna(t) } }
+        nombres.add("📱  Duplicar la pantalla (cualquier tele compatible)"); acciones.add { duplicarPantalla() }
+        AlertDialog.Builder(this, temaDialogo)
+            .setTitle(if (rutas.isEmpty() && dlna.isEmpty()) "No encontré teles en tu WiFi" else "Enviar a la tele")
+            .setItems(nombres.toTypedArray()) { _, i -> acciones[i]() }
+            .setOnDismissListener {
+                try { router?.removeCallback(oyenteRutas) } catch (e: Throwable) { }
+                pantallaCompleta(); mostrarControles()
+            }
+            .show()
+    }
+
+    private fun pausarLocal() {
+        exo?.pause(); vlc?.pause()
+        cargandoDesde = 0L
+    }
+
+    private fun reanudarLocal(posMs: Long) {
+        exo?.let {
+            if (itemActual.vivo) it.seekToDefaultPosition() else if (posMs >= 0) it.seekTo(posMs)
+            it.play(); return
+        }
+        vlc?.let {
+            if (!itemActual.vivo && posMs >= 0) it.time = posMs
+            it.play()
+        }
+    }
+
+    private fun mostrarEstadoTele() {
+        val nombre = destinoNombre
+        if (!::barraTele.isInitialized) return
+        bEnviar.background = circulo(if (nombre != null) 0xFF1E88E5.toInt() else 0x40000000)
+        barraTele.visibility = if (nombre != null && controles.visibility != View.VISIBLE && !bloqueado) View.VISIBLE else View.GONE
+    }
+
+    private fun ponerEstadoTele(t: String) {
+        barraTele.text = "📺  $t"
+        mostrarEstadoTele()
+    }
+
+    // ---- Google Cast ----
+
+    private fun enviarCast(r: MediaRouter.RouteInfo) {
+        val cast = Cast.iniciar(this) ?: return
+        destinoNombre = r.name; teleDlna = null; enCast = true; remotaPausada = false
+        ponerEstadoTele("Conectando con ${r.name}…")
+        pausarLocal()
+        val sesion = cast.sessionManager.currentCastSession
+        if (sesion != null && sesion.isConnected && r.isSelected) { cargarEnCast(sesion); return }
+        try { MediaRouter.getInstance(this).selectRoute(r) } catch (e: Throwable) {
+            mostrarAviso("No se pudo conectar con ${r.name}", 4000); detenerEnvio(true)
+        }
+    }
+
+    private fun cargarEnCast(sesion: CastSession) {
+        val it0 = itemActual
+        val (url, tipo) = Cast.medio(it0.url, it0.vivo)
+        val meta = com.google.android.gms.cast.MediaMetadata(
+            if (it0.vivo) com.google.android.gms.cast.MediaMetadata.MEDIA_TYPE_GENERIC else com.google.android.gms.cast.MediaMetadata.MEDIA_TYPE_MOVIE
+        ).apply {
+            putString(com.google.android.gms.cast.MediaMetadata.KEY_TITLE, it0.nombre)
+            if (it0.logo.startsWith("http")) addImage(WebImage(Uri.parse(it0.logo)))
+        }
+        val info = MediaInfo.Builder(url)
+            .setStreamType(if (it0.vivo) MediaInfo.STREAM_TYPE_LIVE else MediaInfo.STREAM_TYPE_BUFFERED)
+            .setContentType(tipo)
+            .setMetadata(meta)
+            .build()
+        val pedido = MediaLoadRequestData.Builder().setMediaInfo(info).setAutoplay(true)
+            .apply { if (!it0.vivo) setCurrentTime(posicion()) }
+            .build()
+        ultimoEnviado = it0.url
+        val cliente = sesion.remoteMediaClient
+        if (cliente == null) { mostrarAviso("La tele no respondió", 4000); detenerEnvio(true); return }
+        cliente.load(pedido).setResultCallback { r ->
+            runOnUiThread {
+                if (!enCast) return@runOnUiThread
+                ponerEstadoTele("Viendo en $destinoNombre")
+                if (!r.status.isSuccess) mostrarAviso("La tele no pudo abrir este enlace. Probá con «Duplicar la pantalla».", 6000)
+            }
+        }
+    }
+
+    private val oyenteCast = object : SessionManagerListener<CastSession> {
+        override fun onSessionStarting(s: CastSession) {}
+        override fun onSessionStarted(s: CastSession, id: String) { if (enCast) cargarEnCast(s) }
+        override fun onSessionStartFailed(s: CastSession, error: Int) {
+            if (enCast) { mostrarAviso("No se pudo conectar con la tele", 4000); detenerEnvio(true) }
+        }
+        override fun onSessionEnding(s: CastSession) {}
+        override fun onSessionEnded(s: CastSession, error: Int) {
+            // Se cortó desde la tele o desde la notificación: se sigue viendo en el celular.
+            if (enCast) { enCast = false; destinoNombre = null; ultimoEnviado = ""; mostrarEstadoTele(); reanudarLocal(-1) }
+        }
+        override fun onSessionResuming(s: CastSession, id: String) {}
+        override fun onSessionResumed(s: CastSession, wasSuspended: Boolean) { if (enCast && itemActual.url != ultimoEnviado) cargarEnCast(s) }
+        override fun onSessionResumeFailed(s: CastSession, error: Int) {}
+        override fun onSessionSuspended(s: CastSession, reason: Int) {}
+    }
+
+    // ---- DLNA ----
+
+    private fun enviarDlna(t: Dlna.Tele) {
+        destinoNombre = t.nombre; teleDlna = t; enCast = false; remotaPausada = false
+        ponerEstadoTele("Conectando con ${t.nombre}…")
+        pausarLocal()
+        enviarDlnaActual()
+    }
+
+    private fun enviarDlnaActual() {
+        val t = teleDlna ?: return
+        val it0 = itemActual
+        ultimoEnviado = it0.url
+        Thread {
+            val ok = Dlna.reproducir(t, it0.url, it0.nombre, it0.vivo)
+            runOnUiThread {
+                if (teleDlna !== t) return@runOnUiThread
+                if (ok) ponerEstadoTele("Viendo en ${t.nombre}")
+                else { mostrarAviso("${t.nombre} no aceptó el enlace. Probá con «Duplicar la pantalla».", 6000); detenerEnvio(true) }
+            }
+        }.start()
+    }
+
+    // ---- Comunes ----
+
+    private fun reenviar() {
+        if (destinoNombre == null) return
+        pausarLocal()
+        remotaPausada = false
+        if (enCast) Cast.iniciar(this)?.sessionManager?.currentCastSession?.let { cargarEnCast(it) }
+        else enviarDlnaActual()
+        mostrarIndicador("En la tele: ${itemActual.nombre}", 1800)
+    }
+
+    /** El botón de pausa controla la tele mientras se envía. */
+    private fun pausaRemota() {
+        if (enCast) {
+            val c = Cast.iniciar(this)?.sessionManager?.currentCastSession?.remoteMediaClient ?: return
+            c.togglePlayback()
+            remotaPausada = !remotaPausada
+        } else {
+            val t = teleDlna ?: return
+            val pausar = !remotaPausada
+            remotaPausada = pausar
+            Thread { if (pausar) Dlna.pausar(t) else Dlna.seguir(t) }.start()
+        }
+    }
+
+    private fun detenerEnvio(verAca: Boolean) {
+        var pos = -1L
+        if (enCast) {
+            enCast = false
+            val sm = Cast.iniciar(this)?.sessionManager
+            try { pos = sm?.currentCastSession?.remoteMediaClient?.approximateStreamPosition ?: -1L } catch (e: Throwable) { }
+            try { sm?.endCurrentSession(true) } catch (e: Throwable) { }
+        }
+        teleDlna?.let { t -> Thread { Dlna.detener(t) }.start() }
+        teleDlna = null; destinoNombre = null; ultimoEnviado = ""; remotaPausada = false
+        mostrarEstadoTele()
+        if (verAca) reanudarLocal(if (pos > 0) pos else -1L)
+    }
+
+    /** Para teles sin Android ni DLNA: la pantalla del celular se ve en la tele (Miracast, Smart View, Anyview Cast…). */
+    private fun duplicarPantalla() {
+        AlertDialog.Builder(this, temaDialogo)
+            .setTitle("Duplicar la pantalla")
+            .setMessage("1. En la tele, activá «Screen Mirroring», «Duplicar pantalla» o «Anyview Cast» (según la marca).\n\n" +
+                "2. En la lista que se abre, elegí tu tele.\n\n" +
+                "3. Volvé a JhaKet: lo que se ve en el celular se ve en la tele.\n\n" +
+                "Si no se abre la lista, bajá la barra de notificaciones y tocá «Transmitir», «Smart View» o «Duplicar pantalla».")
+            .setPositiveButton("Abrir") { _, _ -> abrirDuplicar() }
+            .setNegativeButton("Cancelar", null)
+            .setOnDismissListener { pantallaCompleta() }
+            .show()
+    }
+
+    private fun abrirDuplicar() {
+        val intentos = mutableListOf<Intent>()
+        if (Build.MANUFACTURER.equals("samsung", true))
+            intentos.add(Intent().setClassName("com.samsung.android.smartmirroring", "com.samsung.android.smartmirroring.CastingDialog"))
+        intentos.add(Intent(Settings.ACTION_CAST_SETTINGS))
+        intentos.add(Intent("android.settings.WIFI_DISPLAY_SETTINGS"))
+        for (i in intentos) {
+            try { startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); return } catch (e: Throwable) { }
+        }
+        mostrarAviso("Bajá la barra de notificaciones y tocá «Transmitir» o «Smart View»", 6000)
+    }
+
+    // ============================================================
     // Avisos, pantalla completa y ciclo de vida
     // ============================================================
 
@@ -1111,7 +1390,7 @@ class PlayerActivity : Activity() {
     }
 
     override fun onPause() { super.onPause(); exo?.pause(); vlc?.pause() }
-    override fun onResume() { super.onResume(); pantallaCompleta(); exo?.play(); vlc?.play() }
+    override fun onResume() { super.onResume(); pantallaCompleta(); if (destinoNombre == null) { exo?.play(); vlc?.play() } }
 
     override fun finish() {
         try {
@@ -1127,6 +1406,7 @@ class PlayerActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        try { Cast.iniciar(this)?.sessionManager?.removeSessionManagerListener(oyenteCast, CastSession::class.java) } catch (e: Throwable) { }
         liberarTodo()
         super.onDestroy()
     }

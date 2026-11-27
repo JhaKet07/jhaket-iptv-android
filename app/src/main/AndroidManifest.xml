@@ -6,6 +6,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Avisos del administrador como notificación (Android 13 en adelante lo pide) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Enviar a la tele: buscar teles Smart (DLNA) en el WiFi de la casa -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <!-- Para que la app aparezca también en Android TV y Google TV -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
@@ -21,6 +24,11 @@
         android:hardwareAccelerated="true"
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.JhaKet">
+
+        <!-- Google Cast (Chromecast, Android TV, Google TV) -->
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.jhaket.iptv.OpcionesCast" />
 
         <activity
             android:name=".MainActivity"
