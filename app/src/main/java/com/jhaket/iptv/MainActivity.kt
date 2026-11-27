@@ -49,6 +49,10 @@ class MainActivity : Activity() {
     /** true mientras se está reproduciendo un contenido: ahí sí se ocultan las barras. */
     @Volatile private var reproduciendo = false
 
+    /** Pantalla completa pedida por una página (el reproductor de un código iframe). */
+    private var vistaCompleta: android.view.View? = null
+    private var avisoCompleta: WebChromeClient.CustomViewCallback? = null
+
     companion object {
         const val APP_HOST = "appassets.androidplatform.net"
         const val APP_URL = "https://$APP_HOST/assets/index.html"
@@ -118,6 +122,24 @@ class MainActivity : Activity() {
         }
 
         web.webChromeClient = object : WebChromeClient() {
+            /* Muchos reproductores web piden pantalla completa al darle play. Sin esto el
+               pedido se perdía y el video no arrancaba (sobre todo en el TV). */
+            override fun onShowCustomView(view: android.view.View, callback: CustomViewCallback) {
+                if (vistaCompleta != null) { callback.onCustomViewHidden(); return }
+                vistaCompleta = view
+                avisoCompleta = callback
+                (window.decorView as android.widget.FrameLayout).addView(
+                    view, android.widget.FrameLayout.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                )
+                view.setBackgroundColor(android.graphics.Color.BLACK)
+                reproduciendo = true
+                hideSystemBars()
+            }
+
+            override fun onHideCustomView() { salirDePantallaCompleta() }
+
             /* "Elegir archivo" de la página (fondos, videos, listas M3U, HTML de la app):
                se abre el selector de archivos del teléfono. Sin esto el botón no hace nada. */
             override fun onShowFileChooser(
@@ -304,6 +326,14 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun nativo(): Boolean = true
 
+        /** Si la app corre en un televisor (Android TV / Google TV). */
+        @JavascriptInterface
+        fun esTv(): Boolean = try {
+            (getSystemService(UI_MODE_SERVICE) as android.app.UiModeManager).currentModeType ==
+                android.content.res.Configuration.UI_MODE_TYPE_TELEVISION ||
+                packageManager.hasSystemFeature("android.software.leanback")
+        } catch (e: Exception) { false }
+
         /** Abre el reproductor nativo (ExoPlayer + VLC). datos: {items:[{u,n,live}], index, start, ua} */
         @JavascriptInterface
         fun playNative(datos: String?) {
@@ -330,7 +360,18 @@ class MainActivity : Activity() {
      * adentro de JhaKet (reproductor, ficha, ventanas); recién al final sale de la app.
      */
     @Deprecated("Se mantiene por compatibilidad con Android viejo")
+    private fun salirDePantallaCompleta() {
+        val v = vistaCompleta ?: return
+        (window.decorView as android.widget.FrameLayout).removeView(v)
+        vistaCompleta = null
+        try { avisoCompleta?.onCustomViewHidden() } catch (e: Exception) { }
+        avisoCompleta = null
+        hideSystemBars()
+    }
+
     override fun onBackPressed() {
+        // Primero se sale de la pantalla completa de la página, si la hay.
+        if (vistaCompleta != null) { salirDePantallaCompleta(); return }
         web.evaluateJavascript("(window.jhaketBack && window.jhaketBack()) ? 1 : 0") { r ->
             if (r?.trim() == "1") return@evaluateJavascript
             if (web.canGoBack()) web.goBack() else finish()
