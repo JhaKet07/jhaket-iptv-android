@@ -3,6 +3,11 @@ package com.jhaket.iptv
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.pm.PackageManager
+import android.graphics.drawable.Icon
+import android.util.Rational
 import android.app.UiModeManager
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -83,6 +88,18 @@ import org.videolan.libvlc.util.VLCVideoLayout
  */
 @OptIn(UnstableApi::class)
 class PlayerActivity : Activity() {
+
+    companion object {
+        /** El reproductor abierto: si se abre otro (por ejemplo, con éste en la ventana flotante), se cierra el anterior. */
+        private var abierto: java.lang.ref.WeakReference<PlayerActivity>? = null
+    }
+
+    // Ventana flotante y control en la barra de notificaciones (sólo en el celular)
+    private var control: ControlMedia? = null
+    private var enPip = false
+    private var entrandoPip = false
+    private var detenido = false
+    private var clavePip = ""
 
     private data class Prog(val titulo: String, val inicio: Long, val fin: Long)
     private data class Item(val url: String, val nombre: String, val vivo: Boolean, val logo: String = "", val guia: List<Prog> = emptyList(),
@@ -176,6 +193,8 @@ class PlayerActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        abierto?.get()?.let { if (it !== this && !it.isFinishing) it.finish() }
+        abierto = java.lang.ref.WeakReference(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         userAgent = try {
@@ -192,6 +211,17 @@ class PlayerActivity : Activity() {
 
         armarPantalla()
         setContentView(raiz)
+        if (!esTv) control = ControlMedia(this, 4711, object : ControlMedia.Acciones {
+            override fun reproducir() {
+                if (destinoNombre != null) { if (remotaPausada) pausaRemota() } else { exo?.play() ?: vlc?.play() }
+            }
+            override fun pausar() {
+                if (destinoNombre != null) { if (!remotaPausada) pausaRemota() } else { exo?.pause() ?: vlc?.pause() }
+            }
+            override fun anterior() = cambiarA(indice - 1)
+            override fun siguiente() = cambiarA(indice + 1)
+            override fun cerrar() { finish() }
+        })
         pantallaCompleta()
         arrancar()
         handler.postDelayed(vigia, 2000)
@@ -570,7 +600,7 @@ class PlayerActivity : Activity() {
 
     private val ocultarControlesR = Runnable { ocultarControles() }
     private fun mostrarControles() {
-        if (bloqueado) return
+        if (bloqueado || enPip) return
         controles.visibility = View.VISIBLE
         handler.removeCallbacks(ocultarControlesR)
         if (!arrastrandoBarra) handler.postDelayed(ocultarControlesR, 4000)
@@ -599,6 +629,8 @@ class PlayerActivity : Activity() {
                 }
             }
             mostrarGuia()
+            actualizarControlMedia()
+            actualizarPip()
             val (w, h) = tamanoVideo()
             val q = etiquetaCalidad(w, h)
             if (q.isNotEmpty()) { tCalidad.text = q; tCalidad.visibility = View.VISIBLE }
@@ -757,6 +789,7 @@ class PlayerActivity : Activity() {
 
     private val ocultarIndicador = Runnable { indicador.visibility = View.GONE }
     private fun mostrarIndicador(t: String, duracionMs: Long) {
+        if (enPip) return
         indicador.text = t
         indicador.visibility = View.VISIBLE
         handler.removeCallbacks(ocultarIndicador)
@@ -1198,7 +1231,7 @@ class PlayerActivity : Activity() {
         val nombre = destinoNombre
         if (!::barraTele.isInitialized) return
         bEnviar.background = circulo(if (nombre != null) 0xFF1E88E5.toInt() else 0x40000000)
-        barraTele.visibility = if (nombre != null && controles.visibility != View.VISIBLE && !bloqueado) View.VISIBLE else View.GONE
+        barraTele.visibility = if (nombre != null && controles.visibility != View.VISIBLE && !bloqueado && !enPip) View.VISIBLE else View.GONE
     }
 
     private fun ponerEstadoTele(t: String) {
@@ -1360,6 +1393,7 @@ class PlayerActivity : Activity() {
 
     private val ocultarAvisoR = Runnable { aviso.visibility = View.GONE }
     private fun mostrarAviso(t: String, duracionMs: Long) {
+        if (enPip) return
         aviso.text = t
         aviso.visibility = View.VISIBLE
         handler.removeCallbacks(ocultarAvisoR)
@@ -1389,7 +1423,97 @@ class PlayerActivity : Activity() {
         if (hasFocus) pantallaCompleta()
     }
 
-    override fun onPause() { super.onPause(); exo?.pause(); vlc?.pause() }
+    override fun onPause() {
+        super.onPause()
+        // En la ventana flotante se sigue reproduciendo.
+        val flotante = enPip || entrandoPip || (Build.VERSION.SDK_INT >= 24 && isInPictureInPictureMode)
+        if (!flotante) { exo?.pause(); vlc?.pause() }
+    }
+
+    override fun onStart() { super.onStart(); detenido = false }
+    override fun onStop() { super.onStop(); detenido = true }
+
+    // ============================================================
+    // Ventana flotante (Picture in Picture) y control en la barra
+    // ============================================================
+
+    private fun pipDisponible() = !esTv && Build.VERSION.SDK_INT >= 26 &&
+        packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+
+    /** Se está viendo en el celular (no en la tele) y no está en pausa. */
+    private fun andandoLocal(): Boolean = destinoNombre == null && (exo?.playWhenReady ?: (vlc?.isPlaying ?: false))
+
+    private fun actualizarControlMedia() {
+        val c = control ?: return
+        if (items.isEmpty()) return
+        val it0 = itemActual
+        val andando = if (destinoNombre != null) !remotaPausada else (exo?.playWhenReady ?: (vlc?.isPlaying ?: false))
+        val ahora = System.currentTimeMillis()
+        val detalle = when {
+            destinoNombre != null -> "En la tele: $destinoNombre"
+            it0.vivo -> it0.guia.firstOrNull { it.inicio <= ahora && it.fin > ahora }?.titulo ?: "En vivo · JhaKet IPTV"
+            else -> "JhaKet IPTV"
+        }
+        c.mostrar(it0.nombre, detalle, logos[it0.logo], andando, posicion(), if (it0.vivo) 0L else duracion(), items.size > 1)
+    }
+
+    private fun accionPip(icono: Int, titulo: String, accion: String, codigo: Int): RemoteAction? {
+        val c = control ?: return null
+        if (Build.VERSION.SDK_INT < 26) return null
+        return RemoteAction(Icon.createWithResource(this, icono), titulo, titulo, c.pi(accion, codigo))
+    }
+
+    private fun paramsPip(andando: Boolean): PictureInPictureParams? {
+        if (Build.VERSION.SDK_INT < 26) return null
+        val (w, h) = tamanoVideo()
+        var r = Rational(16, 9)
+        if (w > 0 && h > 0) {
+            val v = w.toFloat() / h
+            r = when { v > 2.39f -> Rational(239, 100); v < 0.42f -> Rational(42, 100); else -> Rational(w, h) }
+        }
+        val acciones = ArrayList<RemoteAction>()
+        if (items.size > 1) accionPip(R.drawable.ic_rep_anterior, "Anterior", "ant", 1)?.let { acciones.add(it) }
+        (if (andando) accionPip(R.drawable.ic_rep_pausa, "Pausar", "pausa", 2) else accionPip(R.drawable.ic_rep_play, "Reproducir", "play", 3))?.let { acciones.add(it) }
+        if (items.size > 1) accionPip(R.drawable.ic_rep_siguiente, "Siguiente", "sig", 4)?.let { acciones.add(it) }
+        val b = PictureInPictureParams.Builder().setAspectRatio(r).setActions(acciones)
+        // Android 12 en adelante: entra solo a la ventana flotante al ir al inicio.
+        if (Build.VERSION.SDK_INT >= 31) b.setAutoEnterEnabled(andando && destinoNombre == null).setSeamlessResizeEnabled(true)
+        return b.build()
+    }
+
+    private fun actualizarPip() {
+        if (!pipDisponible()) return
+        val andando = if (enPip) (exo?.playWhenReady ?: (vlc?.isPlaying ?: false)) else andandoLocal()
+        val (w, h) = tamanoVideo()
+        val clave = "$andando|$w|$h|${items.size}|$destinoNombre"
+        if (clave == clavePip) return
+        clavePip = clave
+        try { paramsPip(andando)?.let { setPictureInPictureParams(it) } } catch (e: Throwable) { }
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (!pipDisponible() || !andandoLocal() || bloqueado) return
+        if (Build.VERSION.SDK_INT >= 26 && !isInPictureInPictureMode) {
+            entrandoPip = try { paramsPip(true)?.let { enterPictureInPictureMode(it) } ?: false } catch (e: Throwable) { false }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        enPip = isInPictureInPictureMode
+        entrandoPip = false
+        if (enPip) {
+            ocultarControles()
+            aviso.visibility = View.GONE; indicador.visibility = View.GONE; candado.visibility = View.GONE
+            mostrarEstadoTele()
+        } else {
+            pantallaCompleta()
+            mostrarEstadoTele()
+            // Se cerró la ventana flotante con la X (la pantalla queda detenida): se termina.
+            handler.postDelayed({ if (detenido && !enPip) finish() }, 600)
+        }
+    }
     override fun onResume() { super.onResume(); pantallaCompleta(); if (destinoNombre == null) { exo?.play(); vlc?.play() } }
 
     override fun finish() {
@@ -1406,6 +1530,8 @@ class PlayerActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        control?.liberar(); control = null
+        if (abierto?.get() === this) abierto = null
         try { Cast.iniciar(this)?.sessionManager?.removeSessionManagerListener(oyenteCast, CastSession::class.java) } catch (e: Throwable) { }
         liberarTodo()
         super.onDestroy()

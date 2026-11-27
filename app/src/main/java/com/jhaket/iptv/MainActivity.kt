@@ -3,6 +3,15 @@ package com.jhaket.iptv
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.PendingIntent
+import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.app.UiModeManager
+import android.content.res.Configuration
+import android.graphics.drawable.Icon
+import android.os.Handler
+import android.os.Looper
+import android.util.Rational
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -22,6 +31,8 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.webkit.WebViewAssetLoader
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 
 /**
  * App JhaKet IPTV.
@@ -53,9 +64,43 @@ class MainActivity : Activity() {
     private var vistaCompleta: android.view.View? = null
     private var avisoCompleta: WebChromeClient.CustomViewCallback? = null
 
+    // Ventana flotante y control en la barra para los reproductores web (código iframe)
+    private val manejador = Handler(Looper.getMainLooper())
+    private var esTv = false
+    private var control: ControlMedia? = null
+    private var webMedia = false          // hay un reproductor web abierto
+    private var webPausado = false
+    private var webTitulo = ""
+    private var enPip = false
+    private var entrandoPip = false
+    private var detenido = false
+    private var clavePip = ""
+
     companion object {
         const val APP_HOST = "appassets.androidplatform.net"
         const val APP_URL = "https://$APP_HOST/assets/index.html"
+
+        /** Se carga en cada página e iframe: pausa los videos que andan y después sigue sólo esos. */
+        const val SCRIPT_MEDIA = "(function(){if(window.__jkMedia)return;" +
+            "function aplicar(a){try{document.querySelectorAll('video,audio').forEach(function(v){try{" +
+            "if(a==='pause'){if(!v.paused){v.pause();v.__jkP=1;}}else if(v.__jkP){v.__jkP=0;var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
+            "}catch(e){}});}catch(e){}" +
+            "try{for(var i=0;i<window.frames.length;i++){try{window.frames[i].postMessage({__jkMedia:a},'*');}catch(e){}}}catch(e){}}" +
+            "window.__jkMedia=aplicar;" +
+            "window.addEventListener('message',function(e){var d=e.data;if(d&&typeof d==='object'&&d.__jkMedia)aplicar(d.__jkMedia);},true);})()"
+
+        /** ¿Hay un reproductor web abierto? Devuelve {a, t} (abierto y título). */
+        const val JS_ESTADO = "(function(){try{var d=document.documentElement,b=document.body;" +
+            "var e=d.classList.contains('emb-on'),p=!!(b&&b.classList.contains('playing'));" +
+            "var t=document.querySelector('#embedView .emb-t');" +
+            "return JSON.stringify({a:e||p,t:t?t.textContent:''});}catch(x){return '';}})()"
+
+        /** Ventana flotante: se esconde la barra de arriba del reproductor web y se deshace el giro. */
+        const val JS_PIP = "(function(on){var s=document.getElementById('jk-pip-css');if(!s){s=document.createElement('style');s.id='jk-pip-css';" +
+            "s.textContent='html.jk-pip #embedView .emb-top{display:none!important}" +
+            "html.jk-pip #embedView.girado{inset:0!important;top:0!important;left:0!important;width:100%!important;height:100%!important;transform:none!important}" +
+            "html.jk-pip .toast,html.jk-pip #toast{display:none!important}';" +
+            "(document.head||document.documentElement).appendChild(s);}document.documentElement.classList.toggle('jk-pip',on);})"
 
         /** Reproductores externos que JhaKet puede abrir. */
         val REPRODUCTORES = setOf(
@@ -91,6 +136,19 @@ class MainActivity : Activity() {
 
         web = WebView(this)
         setContentView(web)
+        esTv = (getSystemService(UI_MODE_SERVICE) as UiModeManager).currentModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
+            packageManager.hasSystemFeature("android.software.leanback")
+        // En cada página y en cada iframe: pausar y seguir los videos desde la barra de notificaciones.
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT))
+                WebViewCompat.addDocumentStartJavaScript(web, SCRIPT_MEDIA, setOf("*"))
+        } catch (e: Throwable) { }
+        if (!esTv) control = ControlMedia(this, 4712, object : ControlMedia.Acciones {
+            override fun reproducir() { medioWeb("play"); webPausado = false; refrescarWeb() }
+            override fun pausar() { medioWeb("pause"); webPausado = true; refrescarWeb() }
+            override fun cerrar() { cerrarReproductorWeb() }
+        })
+        manejador.post(revisarWeb)
 
         web.settings.apply {
             javaScriptEnabled = true
@@ -468,7 +526,115 @@ class MainActivity : Activity() {
         cb.onReceiveValue(elegidos)
     }
 
-    override fun onPause() { super.onPause(); web.onPause() }
+    override fun onPause() {
+        super.onPause()
+        // En la ventana flotante el reproductor web sigue andando.
+        val flotante = enPip || entrandoPip || (Build.VERSION.SDK_INT >= 24 && isInPictureInPictureMode)
+        if (!flotante) web.onPause()
+    }
     override fun onResume() { super.onResume(); web.onResume(); hideSystemBars(); Avisos.revisarYa(this) }
-    override fun onDestroy() { web.destroy(); super.onDestroy() }
+    override fun onStart() { super.onStart(); detenido = false }
+    override fun onStop() { super.onStop(); detenido = true }
+    override fun onDestroy() {
+        manejador.removeCallbacksAndMessages(null)
+        control?.liberar(); control = null
+        web.destroy(); super.onDestroy()
+    }
+
+    // ============================================================
+    // Reproductores web: ventana flotante y control en la barra
+    // ============================================================
+
+    private fun medioWeb(accion: String) {
+        web.evaluateJavascript("$SCRIPT_MEDIA;window.__jkMedia('$accion')", null)
+    }
+
+    private fun cerrarReproductorWeb() {
+        if (vistaCompleta != null) salirDePantallaCompleta()
+        if (webMedia) web.evaluateJavascript("window.jhaketBack && window.jhaketBack()", null)
+        webMedia = false; webPausado = false
+        control?.ocultar()
+        actualizarPip()
+    }
+
+    /** Cada segundo y medio: ¿hay un reproductor web abierto? (y su título) */
+    private val revisarWeb = object : Runnable {
+        override fun run() {
+            if (!detenido) {
+                web.evaluateJavascript(JS_ESTADO) { r ->
+                    try {
+                        val texto = org.json.JSONArray("[$r]").optString(0, "")
+                        if (texto.isNotEmpty()) {
+                            val o = org.json.JSONObject(texto)
+                            val abierto = o.optBoolean("a") || vistaCompleta != null
+                            val titulo = o.optString("t", "").trim()
+                            if (abierto && (!webMedia || titulo != webTitulo)) webPausado = false
+                            webMedia = abierto; webTitulo = titulo
+                            refrescarWeb()
+                        }
+                    } catch (e: Throwable) { }
+                }
+            }
+            manejador.postDelayed(this, 1500)
+        }
+    }
+
+    private fun refrescarWeb() {
+        val c = control
+        if (c != null) {
+            if (webMedia) {
+                val abrir = PendingIntent.getActivity(this, 4712, Intent(this, MainActivity::class.java),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                c.mostrar(webTitulo.ifEmpty { "JhaKet IPTV" }, "JhaKet IPTV", null, !webPausado, 0L, 0L, false, abrir)
+            } else c.ocultar()
+        }
+        actualizarPip()
+    }
+
+    private fun pipDisponible() = !esTv && Build.VERSION.SDK_INT >= 26 &&
+        packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+
+    private fun paramsPip(): PictureInPictureParams? {
+        if (Build.VERSION.SDK_INT < 26) return null
+        val acciones = ArrayList<RemoteAction>()
+        control?.let { c ->
+            val accion = if (webPausado)
+                RemoteAction(Icon.createWithResource(this, R.drawable.ic_rep_play), "Reproducir", "Reproducir", c.pi("play", 3))
+            else
+                RemoteAction(Icon.createWithResource(this, R.drawable.ic_rep_pausa), "Pausar", "Pausar", c.pi("pausa", 2))
+            acciones.add(accion)
+        }
+        val b = PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).setActions(acciones)
+        if (Build.VERSION.SDK_INT >= 31) b.setAutoEnterEnabled(webMedia && !webPausado).setSeamlessResizeEnabled(true)
+        return b.build()
+    }
+
+    private fun actualizarPip() {
+        if (!pipDisponible()) return
+        val clave = "$webMedia|$webPausado"
+        if (clave == clavePip) return
+        clavePip = clave
+        try { paramsPip()?.let { setPictureInPictureParams(it) } } catch (e: Throwable) { }
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (!pipDisponible() || !webMedia || webPausado) return
+        if (Build.VERSION.SDK_INT >= 26 && !isInPictureInPictureMode) {
+            entrandoPip = try { paramsPip()?.let { enterPictureInPictureMode(it) } ?: false } catch (e: Throwable) { false }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        enPip = isInPictureInPictureMode
+        entrandoPip = false
+        // En la ventana flotante se ve sólo el reproductor (sin la barra de arriba ni el giro).
+        web.evaluateJavascript(JS_PIP + "(" + enPip + ")", null)
+        if (!enPip) {
+            hideSystemBars()
+            // Se cerró la ventana flotante con la X: se cierra el reproductor (deja de sonar).
+            manejador.postDelayed({ if (detenido && !enPip) { cerrarReproductorWeb(); web.onPause() } }, 600)
+        }
+    }
 }

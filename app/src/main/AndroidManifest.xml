@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Enviar a la tele: buscar teles Smart (DLNA) en el WiFi de la casa -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Tocar el control de la barra con la ventana flotante: se vuelve a agrandar -->
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <!-- Para que la app aparezca también en Android TV y Google TV -->
@@ -35,7 +37,9 @@
             android:exported="true"
             android:screenOrientation="fullUser"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode"
-            android:launchMode="singleTask">
+            android:launchMode="singleTask"
+            android:supportsPictureInPicture="true"
+            android:resizeableActivity="true">
 
             <!-- Menú de aplicaciones del teléfono -->
             <intent-filter>
@@ -54,6 +58,8 @@
             android:name=".PlayerActivity"
             android:exported="false"
             android:screenOrientation="sensorLandscape"
+            android:supportsPictureInPicture="true"
+            android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|keyboard|navigation"
             android:theme="@style/Theme.JhaKet" />
     </application>
