@@ -56,6 +56,7 @@ class MainActivity : Activity() {
     private var subida: ValueCallback<Array<Uri>>? = null
     private val pedidoArchivo = 4207
     private val pedidoReproductor = 4300
+    private val pedidoNavegador = 4310
 
     /** true mientras se está reproduciendo un contenido: ahí sí se ocultan las barras. */
     @Volatile private var reproduciendo = false
@@ -411,6 +412,22 @@ class MainActivity : Activity() {
             }
         }
 
+        /** Esta app sabe buscar el stream de una página (canales de página y navegador privado). */
+        @JavascriptInterface
+        fun detector(): Boolean = true
+
+        /** Navegador privado para buscar canales (lo ofrece sólo el panel del administrador).
+            Al volver llama a window.jhaketDesdeNavegador({tipo, url, titulo, h}). */
+        @JavascriptInterface
+        fun abrirNavegador(url: String?) {
+            runOnUiThread {
+                try {
+                    @Suppress("DEPRECATION")
+                    startActivityForResult(Intent(this@MainActivity, NavegadorActivity::class.java).putExtra("url", url ?: ""), pedidoNavegador)
+                } catch (e: Exception) { }
+            }
+        }
+
         /** Número de versión instalada. Coincide con el número de la versión publicada en
             GitHub (v10, v11…): así la página sabe si hay una más nueva para descargar. */
         @JavascriptInterface
@@ -504,6 +521,15 @@ class MainActivity : Activity() {
                         "window.jhaketNativoFin && window.jhaketNativoFin(" + org.json.JSONObject.quote(url) + "," + pos + "," + dur + ")", null
                     )
                 }
+            }
+            hideSystemBars()
+            return
+        }
+        // Vuelve del navegador privado con un stream o una página para agregar.
+        if (requestCode == pedidoNavegador) {
+            val r = data?.getStringExtra("resultado")
+            if (resultCode == RESULT_OK && r != null) {
+                web.evaluateJavascript("window.jhaketDesdeNavegador && window.jhaketDesdeNavegador($r)", null)
             }
             hideSystemBars()
             return

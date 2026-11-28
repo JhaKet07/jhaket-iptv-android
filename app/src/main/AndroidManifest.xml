@@ -65,6 +65,13 @@
             android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|keyboard|navigation"
             android:theme="@style/Theme.JhaKet" />
+        <!-- Navegador privado del administrador: busca canales y detecta sus streams -->
+        <activity
+            android:name=".NavegadorActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|keyboard|navigation"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.JhaKet" />
         <service
             android:name=".ServicioPuente"
             android:exported="false"

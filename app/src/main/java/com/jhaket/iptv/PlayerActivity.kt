@@ -49,6 +49,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -83,7 +84,9 @@ import org.videolan.libvlc.util.VLCVideoLayout
  * subtítulos, formato de imagen y bloqueo. En el teléfono, deslizar del lado izquierdo
  * cambia el volumen y del derecho el brillo (sólo se ve el porcentaje en el medio).
  *
- * Recibe en el extra "datos": { items:[{u,n,live}], index, start, ua }.
+ * Recibe en el extra "datos": { items:[{u,n,live,pg,h}], index, start, ua }.
+ *  - pg: 1 = "canal de página": u es una página web y el stream se busca al abrirlo (Detector).
+ *  - h:  cabeceras para pedir el stream ({"Referer": "..."}), por ejemplo desde el navegador privado.
  * Devuelve al salir: url, pos y dur (segundos) para "Continuar viendo".
  */
 @OptIn(UnstableApi::class)
@@ -102,8 +105,12 @@ class PlayerActivity : Activity() {
     private var clavePip = ""
 
     private data class Prog(val titulo: String, val inicio: Long, val fin: Long)
-    private data class Item(val url: String, val nombre: String, val vivo: Boolean, val logo: String = "", val guia: List<Prog> = emptyList(),
-                            val guiaId: String = "", val guiaNombre: String = "", val guiaPais: String = "")
+    /* url: lo que se reproduce. En un "canal de página" empieza siendo la página y, cuando el
+       detector encuentra el stream, pasa a ser el .m3u8 (original guarda la página). */
+    private data class Item(var url: String, val nombre: String, val vivo: Boolean, val logo: String = "", val guia: List<Prog> = emptyList(),
+                            val guiaId: String = "", val guiaNombre: String = "", val guiaPais: String = "",
+                            val original: String = url, val pagina: Boolean = false,
+                            var cabeceras: Map<String, String> = emptyMap(), var resuelto: Boolean = !pagina)
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var raiz: FrameLayout
@@ -181,6 +188,10 @@ class PlayerActivity : Activity() {
     private var yaReprodujo = false
     private var cargandoDesde = 0L
 
+    // Canales de página: búsqueda del stream en curso y si ya se volvió a buscar tras un error
+    private var busqueda: Detector.Busqueda? = null
+    private var rebuscado = false
+
     // VLC
     private var libVlc: LibVLC? = null
     private var vlc: org.videolan.libvlc.MediaPlayer? = null
@@ -243,8 +254,13 @@ class PlayerActivity : Activity() {
                         val pr = g.optJSONObject(k) ?: continue
                         progs.add(Prog(pr.optString("t", ""), pr.optLong("s", 0L), pr.optLong("e", 0L)))
                     }
+                    // h: cabeceras para pedir el stream (Referer, Origin…) — las manda el navegador privado
+                    val cab = LinkedHashMap<String, String>()
+                    o.optJSONObject("h")?.let { hj -> hj.keys().forEach { k -> cab[k] = hj.optString(k) } }
+                    val esPagina = o.optInt("pg", 0) == 1 || o.optBoolean("pg", false)
                     lista.add(Item(u, o.optString("n", ""), o.optBoolean("live", false), o.optString("l", ""), progs,
-                        o.optString("gid", ""), o.optString("gn", ""), o.optString("gp", "")))
+                        o.optString("gid", ""), o.optString("gn", ""), o.optString("gp", ""),
+                        original = u, pagina = esPagina, cabeceras = cab))
                 }
             }
             items = lista
@@ -911,6 +927,8 @@ class PlayerActivity : Activity() {
     private fun arrancar() {
         liberarTodo()
         reintentos = 0; probeHls = false; probeUa = false; yaReprodujo = false; cargandoDesde = 0L
+        // Canal de página todavía sin stream: primero se lo busca y después se arranca.
+        if (!itemActual.resuelto) { resolverPagina(indice) { arrancar() }; acomodarControles(); mostrarControles(); return }
         val esquema = Uri.parse(itemActual.url).scheme?.lowercase() ?: ""
         if (esquema in setOf("udp", "rtp", "mms", "mmsh", "srt", "rtmps")) arrancarVlc() else arrancarExo(null)
         acomodarControles()
@@ -956,7 +974,12 @@ class PlayerActivity : Activity() {
             .setConnectTimeoutMs(15000)
             .setReadTimeoutMs(20000)
             .setKeepPostFor302Redirects(true)
-        val datos = DefaultDataSource.Factory(this, http)
+        // Cabeceras del contenido que se está viendo (Referer, Origin, Cookie de los canales de página).
+        val conCabeceras = ResolvingDataSource.Factory(http) { spec ->
+            val h = items.getOrNull(indice)?.cabeceras
+            if (h.isNullOrEmpty()) spec else spec.withAdditionalHeaders(h)
+        }
+        val datos = DefaultDataSource.Factory(this, conCabeceras)
         val extractores = DefaultExtractorsFactory()
             // Se espera un cuadro completo antes de mostrar imagen: arrancar sin él daba cuadros verdes.
             .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS)
@@ -986,13 +1009,7 @@ class PlayerActivity : Activity() {
         vista = v
         ponerVideo(v)
 
-        val medios = items.mapIndexed { i, it ->
-            MediaItem.Builder()
-                .setUri(it.url)
-                .setMimeType(tipoPorUrl(it.url, i == indice && forzarHls == true))
-                .setMediaMetadata(MediaMetadata.Builder().setTitle(it.nombre).build())
-                .build()
-        }
+        val medios = items.indices.map { i -> medioDe(i, i == indice && forzarHls == true) }
         p.setMediaItems(medios, indice, if (itemActual.vivo) C.TIME_UNSET else inicioMs)
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) = errorExo(error)
@@ -1003,15 +1020,66 @@ class PlayerActivity : Activity() {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 val i = p.currentMediaItemIndex
                 if (i in items.indices && i != indice) {
-                    indice = i; inicioMs = 0; reintentos = 0; probeHls = false; probeUa = false; yaReprodujo = false
+                    indice = i; inicioMs = 0; reintentos = 0; probeHls = false; probeUa = false; yaReprodujo = false; rebuscado = false
                     cargandoDesde = System.currentTimeMillis()
                     acomodarControles()
                     mostrarIndicador(itemActual.nombre, 1500)
+                    if (!itemActual.resuelto) {
+                        p.stop()
+                        resolverPagina(i) {
+                            val e = exo ?: return@resolverPagina
+                            if (indice != i) return@resolverPagina
+                            e.replaceMediaItem(i, medioDe(i, false))
+                            e.seekTo(i, C.TIME_UNSET); e.prepare(); e.play()
+                        }
+                    }
                 }
             }
         })
         p.playWhenReady = true
         p.prepare()
+    }
+
+    private fun medioDe(i: Int, forzarHls: Boolean): MediaItem {
+        val item = items[i]
+        return MediaItem.Builder()
+            .setUri(item.url)
+            .setMimeType(if (item.resuelto) tipoPorUrl(item.url, forzarHls) else null)
+            .setMediaMetadata(MediaMetadata.Builder().setTitle(item.nombre).build())
+            .build()
+    }
+
+    /** Canal de página: se busca el stream en la página y queda guardado en el item. */
+    private fun resolverPagina(i: Int, despues: () -> Unit) {
+        val item = items.getOrNull(i) ?: return
+        busqueda?.cancelar()
+        cargando.visibility = View.VISIBLE
+        mostrarAviso("Buscando la señal del canal…", 0)
+        busqueda = Detector.buscar(this, item.original) { r ->
+            busqueda = null
+            if (isFinishing || isDestroyed) return@buscar
+            cargando.visibility = View.GONE
+            if (r == null) {
+                mostrarAviso("No se encontró la señal en la página. Probá más tarde u otro canal.", 0)
+                return@buscar
+            }
+            item.url = r.url
+            item.cabeceras = r.cabeceras
+            item.resuelto = true
+            ocultarAviso()
+            despues()
+        }
+    }
+
+    /** Un canal de página que dejó de andar: el enlace venció. Se busca uno nuevo (una vez). */
+    private fun rebuscarSiPagina(): Boolean {
+        val item = itemActual
+        if (!item.pagina || rebuscado) return false
+        rebuscado = true
+        item.url = item.original; item.resuelto = false; item.cabeceras = emptyMap()
+        liberarTodo()
+        resolverPagina(indice) { arrancar() }
+        return true
     }
 
     private fun errorExo(error: PlaybackException) {
@@ -1040,6 +1108,7 @@ class PlayerActivity : Activity() {
             handler.postDelayed({ exo?.let { it.seekToDefaultPosition(); it.prepare() } }, 1500L * reintentos)
             return
         }
+        if (rebuscarSiPagina()) return
         pasarAVlc("Cambiando a VLC…")
     }
 
@@ -1101,6 +1170,7 @@ class PlayerActivity : Activity() {
             val m = Media(lib, Uri.parse(itemActual.url))
             m.setHWDecoderEnabled(!porSoftware, false)
             m.addOption(":http-user-agent=$userAgent")
+            itemActual.cabeceras["Referer"]?.let { m.addOption(":http-referrer=$it") }
             m.addOption(":network-caching=3000")
             mp.media = m
             m.release()
@@ -1118,6 +1188,7 @@ class PlayerActivity : Activity() {
                     }
                     org.videolan.libvlc.MediaPlayer.Event.EncounteredError -> {
                         cargando.visibility = View.GONE
+                        if (itemActual.pagina && !rebuscado) { handler.post { rebuscarSiPagina() }; return@setEventListener }
                         mostrarAviso("No se pudo reproducir este enlace. Probá otro servidor o canal.", 0)
                     }
                     org.videolan.libvlc.MediaPlayer.Event.EndReached ->
@@ -1139,7 +1210,7 @@ class PlayerActivity : Activity() {
         if (nuevo !in items.indices) return
         val p = exo
         if (p != null) { p.seekTo(nuevo, if (items[nuevo].vivo) C.TIME_UNSET else 0L); p.prepare(); p.play(); return }
-        indice = nuevo; inicioMs = 0
+        indice = nuevo; inicioMs = 0; rebuscado = false
         arrancar()                     // con VLC andando, el nuevo vuelve a probar EXO primero
         mostrarIndicador(itemActual.nombre, 1500)
     }
@@ -1597,7 +1668,7 @@ class PlayerActivity : Activity() {
         try {
             if (items.isNotEmpty() && !itemActual.vivo) {
                 setResult(RESULT_OK, Intent()
-                    .putExtra("url", itemActual.url)
+                    .putExtra("url", itemActual.original)
                     .putExtra("pos", posicion() / 1000.0)
                     .putExtra("dur", duracion() / 1000.0))
             }
@@ -1607,6 +1678,7 @@ class PlayerActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        busqueda?.cancelar(); busqueda = null
         control?.liberar(); control = null
         if (teleDlna != null) { Rele.detener(); ServicioPuente.detener(this) }
         if (abierto?.get() === this) abierto = null
