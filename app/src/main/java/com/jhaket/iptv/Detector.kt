@@ -37,8 +37,22 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 object Detector {
 
-    /** Stream encontrado y las cabeceras con las que hay que pedirlo (Referer, Origin, Cookie). */
-    data class Resultado(val url: String, val cabeceras: Map<String, String>, val pagina: String)
+    /** Una calidad de un mismo canal (altura en píxeles: 360, 480, 720, 1080…). */
+    data class Variante(val url: String, val altura: Int)
+
+    /**
+     * Stream encontrado y las cabeceras con las que hay que pedirlo (Referer, Origin, Cookie).
+     *  - maestra: el enlace es una lista HLS "maestra" con varias calidades adentro (el
+     *    reproductor las ofrece y puede ir cambiando solo según la conexión).
+     *  - alturas: las calidades que trae esa lista maestra.
+     *  - variantes: la página tenía varios enlaces separados del mismo canal, uno por calidad.
+     */
+    data class Resultado(val url: String, val cabeceras: Map<String, String>, val pagina: String,
+                         val maestra: Boolean = false, val alturas: List<Int> = emptyList(),
+                         val variantes: List<Variante> = emptyList())
+
+    /** Un enlace candidato y desde dónde se pidió (para el Referer). */
+    private data class Candidato(val url: String, val referer: String?)
 
     /** Algo que se puede cancelar (al cerrar el reproductor antes de que termine la búsqueda). */
     interface Busqueda { fun cancelar() }
@@ -121,7 +135,13 @@ object Detector {
             if (r != null) { terminar(r); return@Thread }
             principal.post {
                 if (listo.get() || actividad.isFinishing) { terminar(null); return@post }
-                oculto = NavegadorOculto(actividad, pagina, ua) { terminar(it) }
+                oculto = NavegadorOculto(actividad, pagina, ua) { candidatos ->
+                    // Ya se juntaron los enlaces que cargó la página: se revisan en segundo plano.
+                    Thread {
+                        val r = try { analizar(candidatos, pagina, ua) } catch (e: Throwable) { null }
+                        terminar(r)
+                    }.start()
+                }
                 principal.postDelayed({ terminar(null) }, limiteMs)
             }
         }.start()
@@ -167,8 +187,42 @@ object Detector {
         } finally { c.disconnect() }
     }
 
-    /** ¿El enlace responde y es una lista HLS/DASH de verdad? */
-    private fun responde(stream: String, ua: String, cabeceras: Map<String, String>): Boolean {
+    private fun enlacesEn(html: String, base: String): List<String> =
+        ENLACE.findAll(html).map { limpiar(it.value) }
+            .filter { esStream(it) && !esPublicidad(it) }
+            .distinct().toList()
+
+    private fun porHttp(pagina: String, ua: String): Resultado? {
+        // La página puede ser directamente el stream.
+        if (esStream(pagina)) return analizar(listOf(Candidato(pagina, null)), pagina, ua)
+            ?: Resultado(pagina, emptyMap(), pagina)
+        val html = bajar(pagina, ua, null) ?: return null
+        val candidatos = ArrayList<Candidato>()
+        enlacesEn(html, pagina).forEach { candidatos.add(Candidato(it, pagina)) }
+        // Un nivel de reproductores (iframes) adentro de la página.
+        if (candidatos.isEmpty()) {
+            val marcos = IFRAME.findAll(html).map { limpiar(it.groupValues[1]) }
+                .mapNotNull { absoluta(pagina, it) }
+                .filter { !esPublicidad(it) }
+                .distinct().take(4).toList()
+            for (m in marcos) {
+                val interno = try { bajar(m, ua, pagina) } catch (e: Throwable) { null } ?: continue
+                enlacesEn(interno, m).forEach { candidatos.add(Candidato(it, m)) }
+            }
+        }
+        if (candidatos.isEmpty()) return null
+        return analizar(candidatos, pagina, ua)
+    }
+
+    // ============================================================
+    // Elegir entre los enlaces encontrados: lista maestra o varias calidades sueltas
+    // ============================================================
+
+    private val RESOLUCION = Regex("""RESOLUTION=\d+x(\d+)""", RegexOption.IGNORE_CASE)
+    private val ALTURAS_VALIDAS = 144..2160
+
+    /** Lee el principio del enlace: null si no responde o no es una lista HLS/DASH. */
+    private fun leerLista(stream: String, ua: String, cabeceras: Map<String, String>): String? {
         return try {
             val c = URL(stream).openConnection() as HttpURLConnection
             try {
@@ -177,39 +231,75 @@ object Detector {
                 c.readTimeout = 8000
                 c.setRequestProperty("User-Agent", ua)
                 cabeceras.forEach { (k, v) -> c.setRequestProperty(k, v) }
-                if (c.responseCode !in 200..299) return false
-                val inicio = c.inputStream.use { ins -> val b = ByteArray(512); val n = ins.read(b); if (n > 0) String(b, 0, n) else "" }
-                inicio.contains("#EXTM3U") || inicio.contains("<MPD", true)
+                if (c.responseCode !in 200..299) return null
+                val texto = c.inputStream.use { ins ->
+                    val out = java.io.ByteArrayOutputStream(); val buf = ByteArray(8192)
+                    while (out.size() < 65536) { val n = ins.read(buf); if (n < 0) break; out.write(buf, 0, n) }
+                    String(out.toByteArray(), Charsets.UTF_8)
+                }
+                if (texto.contains("#EXTM3U") || texto.contains("<MPD", true)) texto else null
             } finally { c.disconnect() }
-        } catch (e: Throwable) { false }
+        } catch (e: Throwable) { null }
     }
 
-    private fun enlacesEn(html: String, base: String): List<String> =
-        ENLACE.findAll(html).map { limpiar(it.value) }
-            .filter { esStream(it) && !esPublicidad(it) }
-            .distinct().toList()
-
-    private fun porHttp(pagina: String, ua: String): Resultado? {
-        // La página puede ser directamente el stream.
-        if (esStream(pagina)) return Resultado(pagina, emptyMap(), pagina)
-        val html = bajar(pagina, ua, null) ?: return null
-        for (s in enlacesEn(html, pagina)) {
-            val h = cabecerasPara(s, pagina)
-            if (responde(s, ua, h)) return Resultado(s, h, pagina)
-        }
-        // Un nivel de reproductores (iframes) adentro de la página.
-        val marcos = IFRAME.findAll(html).map { limpiar(it.groupValues[1]) }
-            .mapNotNull { absoluta(pagina, it) }
-            .filter { !esPublicidad(it) }
-            .distinct().take(4).toList()
-        for (m in marcos) {
-            val interno = try { bajar(m, ua, pagina) } catch (e: Throwable) { null } ?: continue
-            for (s in enlacesEn(interno, m)) {
-                val h = cabecerasPara(s, pagina, m)
-                if (responde(s, ua, h)) return Resultado(s, h, pagina)
+    /** La calidad que dice el nombre del enlace (…_720p.m3u8, …/1080/…, 1280x720…). */
+    fun alturaPorNombre(url: String): Int {
+        val u = url.lowercase().substringBefore('?')
+        val pruebas = listOf(
+            Regex("""(\d{3,4})p(?![a-z])"""),
+            Regex("""\d{3,4}x(\d{3,4})"""),
+            Regex("""[/_\-.](\d{3,4})(?:[/_\-.]|$)""")
+        )
+        for (r in pruebas) {
+            for (m in r.findAll(u)) {
+                val h = m.groupValues[1].toIntOrNull() ?: continue
+                if (h in ALTURAS_VALIDAS && h in setOf(144, 240, 288, 360, 404, 432, 480, 540, 576, 720, 900, 1080, 1440, 2160)) return h
             }
         }
-        return null
+        return 0
+    }
+
+    /**
+     * De todos los enlaces que se encontraron:
+     *  - si alguno es una lista maestra (trae varias calidades), se usa ese;
+     *  - si hay varios enlaces sueltos con distintas calidades, se guardan todos para elegir;
+     *  - si no, el primero que funcione.
+     */
+    private fun analizar(candidatos: List<Candidato>, pagina: String, ua: String): Resultado? {
+        val vistos = LinkedHashMap<String, Candidato>()
+        for (c in candidatos) if (!vistos.containsKey(c.url) && !esPublicidad(c.url)) vistos[c.url] = c
+        var mejorMaestra: Resultado? = null
+        val sueltos = ArrayList<Pair<Candidato, Map<String, String>>>()
+        for (c in vistos.values.take(10)) {
+            val h = cabecerasPara(c.url, pagina, c.referer)
+            val texto = leerLista(c.url, ua, h) ?: continue
+            if (texto.contains("#EXT-X-STREAM-INF")) {
+                val alturas = RESOLUCION.findAll(texto).mapNotNull { it.groupValues[1].toIntOrNull() }
+                    .filter { it in ALTURAS_VALIDAS }.distinct().sortedDescending().toList()
+                if (mejorMaestra == null || alturas.size > mejorMaestra.alturas.size)
+                    mejorMaestra = Resultado(c.url, h, pagina, maestra = true, alturas = alturas)
+            } else if (texto.contains("<MPD", true)) {
+                // DASH: también trae las calidades adentro; el reproductor las ofrece.
+                if (mejorMaestra == null) mejorMaestra = Resultado(c.url, h, pagina, maestra = true)
+            } else {
+                sueltos.add(Pair(c, h))
+            }
+        }
+        mejorMaestra?.let { return it }
+        if (sueltos.isEmpty()) return null
+        // Varios enlaces del mismo canal en distintas calidades: se guardan todos.
+        val porAltura = LinkedHashMap<Int, Pair<Candidato, Map<String, String>>>()
+        for (s in sueltos) {
+            val alt = alturaPorNombre(s.first.url)
+            if (alt > 0 && !porAltura.containsKey(alt)) porAltura[alt] = s
+        }
+        if (porAltura.size >= 2) {
+            val variantes = porAltura.entries.sortedByDescending { it.key }.map { Variante(it.value.first.url, it.key) }
+            val mejor = porAltura.entries.maxByOrNull { it.key }!!.value
+            return Resultado(mejor.first.url, mejor.second, pagina, variantes = variantes)
+        }
+        val primero = sueltos.first()
+        return Resultado(primero.first.url, primero.second, pagina)
     }
 
     fun absoluta(base: String, rel: String): String? = try {
@@ -232,8 +322,15 @@ object Detector {
         private val actividad: Activity,
         private val pagina: String,
         ua: String,
-        private val encontrado: (Resultado) -> Unit
+        private val encontrado: (List<Candidato>) -> Unit
     ) {
+        /* Cuando aparece el primer enlace se esperan unos segundos más: muchas páginas cargan
+           primero una calidad y después la lista maestra u otras calidades. */
+        private val juntados = LinkedHashMap<String, Candidato>()
+        private var avisoProgramado = false
+        private val entregar = Runnable {
+            if (!cerrado) encontrado(juntados.values.toList())
+        }
         private val web = WebView(actividad)
         private val principal = Handler(Looper.getMainLooper())
         @Volatile private var cerrado = false
@@ -297,14 +394,18 @@ object Detector {
         private fun avisar(stream: String, referer: String?) {
             if (cerrado) return
             val s = limpiar(stream)
-            val r = Resultado(s, cabecerasPara(s, pagina, referer), pagina)
-            principal.post { if (!cerrado) encontrado(r) }
+            principal.post {
+                if (cerrado || juntados.containsKey(s)) return@post
+                juntados[s] = Candidato(s, referer)
+                if (!avisoProgramado) { avisoProgramado = true; principal.postDelayed(entregar, 3000) }
+            }
         }
 
         fun cerrar() {
             if (cerrado) return
             cerrado = true
             principal.removeCallbacks(tocarPlay)
+            principal.removeCallbacks(entregar)
             try {
                 web.stopLoading()
                 (web.parent as? ViewGroup)?.removeView(web)

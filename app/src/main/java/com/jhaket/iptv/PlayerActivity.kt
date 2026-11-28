@@ -110,7 +110,9 @@ class PlayerActivity : Activity() {
     private data class Item(var url: String, val nombre: String, val vivo: Boolean, val logo: String = "", val guia: List<Prog> = emptyList(),
                             val guiaId: String = "", val guiaNombre: String = "", val guiaPais: String = "",
                             val original: String = url, val pagina: Boolean = false,
-                            var cabeceras: Map<String, String> = emptyMap(), var resuelto: Boolean = !pagina)
+                            var cabeceras: Map<String, String> = emptyMap(), var resuelto: Boolean = !pagina,
+                            /* Calidades sueltas del mismo canal (enlaces separados) y las de la lista maestra */
+                            var variantes: List<Detector.Variante> = emptyList(), var alturasMaestra: List<Int> = emptyList())
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var raiz: FrameLayout
@@ -141,6 +143,7 @@ class PlayerActivity : Activity() {
     private lateinit var tTotal: TextView
     private lateinit var bVivo: TextView
     private lateinit var bPistas: ImageButton
+    private lateinit var bCalidad: ImageButton
     private lateinit var bAspecto: ImageButton
     private lateinit var bBloquear: ImageButton
     private lateinit var candado: ImageView       // el que aparece con la pantalla bloqueada
@@ -190,6 +193,12 @@ class PlayerActivity : Activity() {
 
     // Canales de página: búsqueda del stream en curso y si ya se volvió a buscar tras un error
     private var busqueda: Detector.Busqueda? = null
+
+    /* Calidad elegida: "auto" (según la conexión), "mejor" o una altura ("720"). Queda guardada. */
+    private val prefs by lazy { getSharedPreferences("jhaket", MODE_PRIVATE) }
+    private var calidad: String
+        get() = prefs.getString("calidad", "auto") ?: "auto"
+        set(v) { prefs.edit().putString("calidad", v).apply() }
     private var rebuscado = false
 
     // VLC
@@ -416,9 +425,10 @@ class PlayerActivity : Activity() {
         if (esTv) bEnviar.visibility = View.GONE
         fila.addView(bEnviar)
         bPistas = boton(R.drawable.ic_rep_pistas, "Audio y subtítulos", 44) { elegirPistas() }
+        bCalidad = boton(R.drawable.ic_rep_calidad, "Calidad de imagen", 44) { elegirCalidad() }
         bAspecto = boton(R.drawable.ic_rep_aspecto, "Formato de imagen", 44) { cambiarAspecto() }
         bBloquear = boton(R.drawable.ic_candado_abierto, "Bloquear la pantalla", 44) { alternarBloqueo() }
-        fila.addView(bPistas); fila.addView(bAspecto); fila.addView(bBloquear)
+        fila.addView(bCalidad); fila.addView(bPistas); fila.addView(bAspecto); fila.addView(bBloquear)
         abajo.addView(fila)
         controles.addView(abajo, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
@@ -481,6 +491,7 @@ class PlayerActivity : Activity() {
         bSiguiente.isEnabled = indice < items.size - 1; bSiguiente.alpha = if (indice < items.size - 1) 1f else 0.35f
         tMotor.text = if (vlc != null) (if (porSoftware) "VLC · SW" else "VLC") else "EXO"
         tCalidad.visibility = View.GONE
+        actualizarBotonCalidad()
         bVerificar.visibility = if (esAdmin && vivo && itemActual.guia.isNotEmpty()) View.VISIBLE else View.GONE
         // Cambió el canal o el episodio mientras se envía a la tele: se manda el nuevo.
         if (destinoNombre != null && itemActual.url != ultimoEnviado) handler.post { reenviar() }
@@ -994,6 +1005,7 @@ class PlayerActivity : Activity() {
             .build()
         val p = ExoPlayer.Builder(this, renderers).setMediaSourceFactory(fuentes).setLoadControl(bufer).build()
         exo = p
+        aplicarCalidadExo(p)
 
         val v = PlayerView(this).apply {
             player = p
@@ -1013,6 +1025,7 @@ class PlayerActivity : Activity() {
         p.setMediaItems(medios, indice, if (itemActual.vivo) C.TIME_UNSET else inicioMs)
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) = errorExo(error)
+            override fun onTracksChanged(tracks: androidx.media3.common.Tracks) { actualizarBotonCalidad() }
             override fun onPlaybackStateChanged(s: Int) {
                 if (s == Player.STATE_BUFFERING) { if (cargandoDesde == 0L) cargandoDesde = System.currentTimeMillis() } else cargandoDesde = 0L
                 if (s == Player.STATE_READY) { reintentos = 0; yaReprodujo = true; ocultarAviso() }
@@ -1040,6 +1053,104 @@ class PlayerActivity : Activity() {
         p.prepare()
     }
 
+    // ============================================================
+    // Calidad de imagen
+    // ============================================================
+
+    /** Alturas que trae la lista maestra que está reproduciendo ExoPlayer. */
+    private fun alturasExo(): List<Int> {
+        val p = exo ?: return emptyList()
+        val out = sortedSetOf<Int>(compareByDescending { it })
+        for (g in p.currentTracks.groups) {
+            if (g.type != C.TRACK_TYPE_VIDEO) continue
+            for (i in 0 until g.length) {
+                if (!g.isTrackSupported(i)) continue
+                val h = g.getTrackFormat(i).height
+                if (h > 0) out.add(h)
+            }
+        }
+        return out.toList()
+    }
+
+    /** Calidades para elegir del contenido actual (vacío o una sola = no hay para elegir). */
+    private fun calidadesDisponibles(): List<Int> {
+        val it = itemActual
+        if (it.variantes.size >= 2) return it.variantes.map { v -> v.altura }
+        if (exo != null) return alturasExo()
+        if (vlc != null) return it.alturasMaestra
+        return emptyList()
+    }
+
+    /** Blanco si hay varias calidades para elegir; gris si hay una sola. */
+    private fun actualizarBotonCalidad() {
+        if (!::bCalidad.isInitialized || items.isEmpty()) return
+        val hay = calidadesDisponibles().size >= 2
+        bCalidad.alpha = if (hay) 1f else 0.35f
+    }
+
+    /** Entre enlaces sueltos del mismo canal, el que corresponde a la calidad elegida. */
+    private fun varianteSegunPreferencia(item: Item): Detector.Variante? {
+        val vs = item.variantes.sortedByDescending { it.altura }
+        if (vs.size < 2) return null
+        val c = calidad
+        val h = c.toIntOrNull() ?: return vs.first()          // auto o mejor: la más alta
+        return vs.firstOrNull { it.altura <= h } ?: vs.last()
+    }
+
+    private fun aplicarCalidadExo(p: ExoPlayer) {
+        val b = p.trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+        when (val c = calidad) {
+            "auto" -> b.setForceHighestSupportedBitrate(false).setMaxVideoSize(Int.MAX_VALUE, Int.MAX_VALUE)
+            "mejor" -> b.setForceHighestSupportedBitrate(true).setMaxVideoSize(Int.MAX_VALUE, Int.MAX_VALUE)
+            else -> b.setForceHighestSupportedBitrate(true).setMaxVideoSize(Int.MAX_VALUE, c.toIntOrNull() ?: Int.MAX_VALUE)
+        }
+        p.trackSelectionParameters = b.build()
+    }
+
+    private fun elegirCalidad() {
+        val alturas = calidadesDisponibles()
+        if (alturas.size < 2) {
+            mostrarIndicador("Este contenido tiene una sola calidad", 1800)
+            return
+        }
+        val actual = calidad
+        val sueltas = itemActual.variantes.size >= 2
+        val opciones = ArrayList<Pair<String, String>>()     // (texto, valor)
+        if (!sueltas) opciones.add(Pair("Automática (según tu conexión)", "auto"))
+        opciones.add(Pair("Mejor calidad", "mejor"))
+        alturas.forEach { opciones.add(Pair("${it}p", it.toString())) }
+        val textos = opciones.map { (t, v) -> if (v == actual || (sueltas && actual == "auto" && v == "mejor")) "$t  ✓" else t }
+        handler.removeCallbacks(ocultarControlesR)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Calidad de imagen")
+            .setItems(textos.toTypedArray()) { _, i -> cambiarCalidad(opciones[i].second); mostrarControles() }
+            .setOnDismissListener { pantallaCompleta(); mostrarControles() }
+            .show()
+    }
+
+    private fun cambiarCalidad(valor: String) {
+        calidad = valor
+        val it = itemActual
+        mostrarIndicador(when (valor) { "auto" -> "Calidad automática"; "mejor" -> "Mejor calidad"; else -> "${valor}p" }, 1500)
+        // Enlaces sueltos: se cambia al enlace de esa calidad.
+        val v = varianteSegunPreferencia(it)
+        if (v != null) {
+            if (v.url == it.url) return
+            it.url = v.url
+            if (vlc != null) {
+                inicioMs = if (it.vivo) 0 else posicion()
+                liberarVlc(); arrancarVlc(); acomodarControles()
+            } else reiniciarExo(false)
+            return
+        }
+        // Lista maestra: ExoPlayer cambia de calidad sin cortar; VLC se reabre con la nueva.
+        exo?.let { aplicarCalidadExo(it); return }
+        if (vlc != null) {
+            inicioMs = if (it.vivo) 0 else posicion()
+            liberarVlc(); arrancarVlc(); acomodarControles()
+        }
+    }
+
     private fun medioDe(i: Int, forzarHls: Boolean): MediaItem {
         val item = items[i]
         return MediaItem.Builder()
@@ -1065,7 +1176,10 @@ class PlayerActivity : Activity() {
             }
             item.url = r.url
             item.cabeceras = r.cabeceras
+            item.variantes = r.variantes
+            item.alturasMaestra = r.alturas
             item.resuelto = true
+            varianteSegunPreferencia(item)?.let { item.url = it.url }
             ocultarAviso()
             despues()
         }
@@ -1171,6 +1285,12 @@ class PlayerActivity : Activity() {
             m.setHWDecoderEnabled(!porSoftware, false)
             m.addOption(":http-user-agent=$userAgent")
             itemActual.cabeceras["Referer"]?.let { m.addOption(":http-referrer=$it") }
+            // Calidad en listas maestras (HLS adaptativo de VLC)
+            when (val c = calidad) {
+                "auto" -> {}
+                "mejor" -> m.addOption(":adaptive-logic=highest")
+                else -> c.toIntOrNull()?.let { m.addOption(":adaptive-maxheight=$it") }
+            }
             m.addOption(":network-caching=3000")
             mp.media = m
             m.release()
@@ -1183,7 +1303,7 @@ class PlayerActivity : Activity() {
                 when (e.type) {
                     org.videolan.libvlc.MediaPlayer.Event.Buffering -> cargando.visibility = if (e.buffering < 100f) View.VISIBLE else View.GONE
                     org.videolan.libvlc.MediaPlayer.Event.Playing -> {
-                        cargando.visibility = View.GONE; ocultarAviso()
+                        cargando.visibility = View.GONE; ocultarAviso(); actualizarBotonCalidad()
                         if (inicioMs > 0) { mp.time = inicioMs; inicioMs = 0 }
                     }
                     org.videolan.libvlc.MediaPlayer.Event.EncounteredError -> {
